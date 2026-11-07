@@ -14,6 +14,8 @@
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <mutex>
+#include <regex>
 
 
 #include <fmt/core.h>
@@ -32,6 +34,9 @@
 #include "ygopro-core/card_data.h"
 #include "ygopro-core/duel.h"
 #include "ygopro-core/ocgapi.h"
+#include "ygopro-core/field.h"
+#include "ygopro-core/effect.h"
+#include "ygopro-core/card.h"
 
 // clang-format on
 
@@ -1395,6 +1400,49 @@ inline byte *script_reader_callback(const char *name, int *lenptr) {
   return it->second.buf;
 }
 
+// Lua script errors (msg_type 1) and Debug.Message output (msg_type 2) are
+// reported by the core through the message handler. Without a handler they
+// are discarded, so log them to stderr with the card code.
+static std::mutex lua_log_mutex_;
+
+inline uint32 message_handler_callback(intptr_t pduel, uint32 msg_type) {
+  if (msg_type != 1 && msg_type != 2) {
+    return 0;
+  }
+  char buf[1024] = {0};
+  get_log_message(pduel, buf);
+  std::string msg(buf);
+
+  // Card code from the chunk name ("./script/c12345.lua:40: ...") or from the
+  // core's own messages ("\"CallCardFunction\"(c12345.operation): ...").
+  static const std::regex code_re("c([0-9]+)[.:]");
+  std::smatch m;
+  std::string code = "?";
+  if (std::regex_search(msg, m, code_re)) {
+    code = m[1].str();
+  }
+
+  // Context: card of the chain link currently resolving, if any. Useful when
+  // the error is raised inside utility.lua or procedure.lua.
+  uint32 chain_code = 0;
+  auto *pd = reinterpret_cast<duel *>(pduel);
+  if (pd != nullptr && pd->game_field != nullptr) {
+    auto &chain = pd->game_field->core.current_chain;
+    if (!chain.empty() && chain.back().triggering_effect != nullptr) {
+      auto *handler = chain.back().triggering_effect->get_handler();
+      if (handler != nullptr) {
+        chain_code = handler->data.code;
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(lua_log_mutex_);
+  fmt::print(stderr, "[{}] code={} chain={} msg={}\n",
+             msg_type == 1 ? "lua-error" : "lua-debug", code, chain_code, msg);
+  std::fflush(stderr);
+  return 0;
+}
+
 static void init_module(const std::string &db_path,
                         const std::string &code_list_file,
                         const std::map<std::string, std::string> &decks) {
@@ -1461,6 +1509,7 @@ static void init_module(const std::string &db_path,
 
   set_card_reader(card_reader_callback);
   set_script_reader(script_reader_callback);
+  set_message_handler(message_handler_callback);
 }
 
 inline std::string getline() {
