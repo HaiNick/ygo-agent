@@ -1,6 +1,6 @@
 SCRIPTS_REPO := "https://github.com/mycard/ygopro-scripts.git"
 SCRIPTS_DIR := "../ygopro-scripts"
-DATABASE_REPO := "https://github.com/mycard/ygopro-database/raw/7b1874301fc1aa52bd60585589f771e372ff52cc/locales"
+DATABASE_REPO := "https://github.com/mycard/ygopro-database/raw/02e589ff78480151867abf5b399ae0689c6cd668/locales"
 LOCALES := en zh
 
 .PHONY: all assets script py_install ygoenv_so clean dev
@@ -23,7 +23,7 @@ script : scripts/script
 
 scripts/script:
 	if [ ! -d $(SCRIPTS_DIR) ] ; then git clone $(SCRIPTS_REPO) $(SCRIPTS_DIR); fi
-	cd $(SCRIPTS_DIR) && git checkout 8e7fde9
+	cd $(SCRIPTS_DIR) && git checkout b83db1cc3f512d3bec2faafb9ecf199143332be1
 	ln -sf "../$(SCRIPTS_DIR)" scripts/script
 
 assets: $(LOCALES)
