@@ -138,36 +138,6 @@ combinations_with_weight2(
   return results;
 }
 
-inline std::vector<uint32_t>
-parse_codes_from_opcodes(const std::vector<uint32_t> &opcodes) {
-  int n = opcodes.size();
-  std::vector<uint32_t> codes;
-
-  if (n == 2) {
-    codes.push_back(opcodes[0]);
-    return codes;
-  }
-
-  if (((n - 2) % 3) != 0) {
-    for (int i = 0; i < n; i++) {
-      fmt::println("{}: {}", i, opcodes[i]);
-    }
-    throw std::runtime_error("invalid format of opcodes");
-  }
-
-  for (int i = 2; i < n; i += 3) {
-    codes.push_back(opcodes[i]);
-    if ((opcodes[i + 1] != 1073742080) || (opcodes[i + 2] != 1073741829)) {
-      for (int i = 0; i < n; i++) {
-        fmt::println("{}: {}", i, opcodes[i]);
-      }
-      auto err = fmt::format("invalid format of opcodes starting from {}", i);
-      throw std::runtime_error(err);
-    }
-  }
-  return codes;
-}
-
 static std::string msg_to_string(int msg) {
   switch (msg) {
   case MSG_RETRY:
@@ -1285,6 +1255,13 @@ static ankerl::unordered_dense::map<std::string, std::vector<CardCode>>
 static std::vector<std::string> deck_names_;
 static ankerl::unordered_dense::map<std::string, int> deck_names_ids_;
 
+// Card-name declaration (MSG_ANNOUNCE_CARD) candidate sources.
+// code_list_order_: every code in code_list.txt, in file order (fallback).
+// pool_codes_ranked_: every code in the loaded decks, ranked by the number of
+// deck files containing it (desc), then by code.
+static std::vector<CardCode> code_list_order_;
+static std::vector<CardCode> pool_codes_ranked_;
+
 inline const Card &c_get_card(CardCode code) {
   auto it = cards_.find(code);
   if (it != cards_.end()) {
@@ -1443,6 +1420,90 @@ inline uint32 message_handler_callback(intptr_t pduel, uint32 msg_type) {
   return 0;
 }
 
+// Port of ygopro-core playerop.cpp is_declarable() (core 0.0.2). The env must
+// only offer codes the core accepts: a rejected code makes the core answer
+// MSG_RETRY, which the env treats as fatal. Keep this in sync with the core.
+inline bool is_declarable_env(const card_data &cd,
+                              const std::vector<uint32_t> &opcode) {
+  std::vector<int32_t> stack;
+  auto pop = [&stack]() {
+    int32_t v = stack.back();
+    stack.pop_back();
+    return v;
+  };
+  for (uint32_t it : opcode) {
+    switch (it) {
+    case OPCODE_ADD:
+    case OPCODE_SUB:
+    case OPCODE_MUL:
+    case OPCODE_DIV:
+    case OPCODE_AND:
+    case OPCODE_OR: {
+      if (stack.size() >= 2) {
+        int32_t rhs = pop();
+        int32_t lhs = pop();
+        int32_t r = 0;
+        switch (it) {
+        case OPCODE_ADD: r = lhs + rhs; break;
+        case OPCODE_SUB: r = lhs - rhs; break;
+        case OPCODE_MUL: r = lhs * rhs; break;
+        case OPCODE_DIV: r = rhs != 0 ? lhs / rhs : 0; break;
+        case OPCODE_AND: r = lhs && rhs; break;
+        default: r = lhs || rhs; break;
+        }
+        stack.push_back(r);
+      }
+      break;
+    }
+    case OPCODE_NEG:
+      if (!stack.empty()) stack.push_back(-pop());
+      break;
+    case OPCODE_NOT:
+      if (!stack.empty()) stack.push_back(!pop());
+      break;
+    case OPCODE_ISCODE:
+      if (!stack.empty()) {
+        int32_t code = pop();
+        stack.push_back(cd.code == static_cast<uint32_t>(code));
+      }
+      break;
+    case OPCODE_ISSETCARD:
+      if (!stack.empty()) {
+        int32_t set_code = pop();
+        stack.push_back(cd.is_setcode(set_code));
+      }
+      break;
+    case OPCODE_ISTYPE:
+      if (!stack.empty()) {
+        int32_t val = pop();
+        stack.push_back(cd.type & val);
+      }
+      break;
+    case OPCODE_ISRACE:
+      if (!stack.empty()) {
+        int32_t race = pop();
+        stack.push_back(cd.race & race);
+      }
+      break;
+    case OPCODE_ISATTRIBUTE:
+      if (!stack.empty()) {
+        int32_t attribute = pop();
+        stack.push_back(cd.attribute & attribute);
+      }
+      break;
+    default:
+      stack.push_back(static_cast<int32_t>(it));
+      break;
+    }
+  }
+  if (stack.size() != 1 || stack.back() == 0) {
+    return false;
+  }
+  return cd.code == CARD_MARINE_DOLPHIN || cd.code == CARD_TWINKLE_MOSS ||
+         (!cd.alias && (cd.type & (TYPE_MONSTER | TYPE_TOKEN)) !=
+                           (TYPE_MONSTER | TYPE_TOKEN));
+}
+
 static void init_module(const std::string &db_path,
                         const std::string &code_list_file,
                         const std::map<std::string, std::string> &decks) {
@@ -1456,6 +1517,7 @@ static void init_module(const std::string &db_path,
   int i = 0;
   CardCode code;
   int has_script, script_len;
+  code_list_order_.clear();
   while (std::getline(file, line)) {
     i++;
     std::istringstream iss(line);
@@ -1464,6 +1526,7 @@ static void init_module(const std::string &db_path,
         continue;
     }
     card_ids_[code] = i;
+    code_list_order_.push_back(code);
     cards_[code] = db_query_card(db, code);
     cards_data_[code] = db_query_card_data(db, code);
     if (has_script) {
@@ -1491,6 +1554,32 @@ static void init_module(const std::string &db_path,
 
   for (auto &[name, deck] : extra_decks_) {
     sort_extra_deck(deck);
+  }
+
+  {
+    ankerl::unordered_dense::map<CardCode, int> deck_count;
+    for (const auto &[name, deck] : main_decks_) {
+      if (name.empty() || name[0] == '_') {
+        continue;
+      }
+      std::set<CardCode> unique(deck.begin(), deck.end());
+      auto it = extra_decks_.find(name);
+      if (it != extra_decks_.end()) {
+        unique.insert(it->second.begin(), it->second.end());
+      }
+      for (auto c : unique) {
+        deck_count[c]++;
+      }
+    }
+    pool_codes_ranked_.clear();
+    for (const auto &[c, n] : deck_count) {
+      pool_codes_ranked_.push_back(c);
+    }
+    std::sort(pool_codes_ranked_.begin(), pool_codes_ranked_.end(),
+              [&](CardCode a, CardCode b) {
+                int na = deck_count[a], nb = deck_count[b];
+                return na != nb ? na > nb : a < b;
+              });
   }
 
   card_data card;
@@ -1778,6 +1867,8 @@ protected:
   int ha_p_2_ = 0;
 
   std::unordered_set<std::string> revealed_;
+  // codes each player has shown publicly this duel, most recent at the back
+  std::vector<CardCode> seen_codes_[2];
 
   // multi select
   int ms_idx_ = -1;
@@ -1906,6 +1997,8 @@ public:
 
     turn_count_ = 0;
     ms_idx_ = -1;
+    seen_codes_[0].clear();
+    seen_codes_[1].clear();
 
     history_actions_1_.Zero();
     history_actions_2_.Zero();
@@ -3351,9 +3444,145 @@ private:
   // 1. read msg_ from data_ and update dp_
   // 2. (optional) print information if verbose_ is true
   // 3. update to_play_ and options_ if need action
+  void note_seen(uint32_t player, CardCode code) {
+    if (player > 1 || code == 0) {
+      return;
+    }
+    auto &v = seen_codes_[player];
+    auto it = std::find(v.begin(), v.end(), code);
+    if (it != v.end()) {
+      v.erase(it);
+    }
+    v.push_back(code);
+  }
+
+  uint32_t peek_u32(int off) const {
+    uint32_t v;
+    std::memcpy(&v, data_ + dp_ + off, 4);
+    return v;
+  }
+
+  // Record codes made public by the current message, without consuming it
+  // (most handlers skip their payload when not verbose).
+  void track_seen_codes() {
+    auto avail = [this](int n) { return dp_ + n <= dl_; };
+    switch (msg_) {
+    case MSG_SUMMONING:
+    case MSG_SPSUMMONING:
+    case MSG_FLIPSUMMONING:
+    case MSG_CHAINING:
+      if (avail(8)) {
+        note_seen(peek_u32(4) & 0xff, peek_u32(0));
+      }
+      break;
+    case MSG_MOVE:
+      if (avail(12)) {
+        uint32_t newloc = peek_u32(8);
+        uint32_t loc = (newloc >> 8) & 0xff, pos = (newloc >> 24) & 0xff;
+        if (loc == LOCATION_GRAVE ||
+            ((loc & (LOCATION_ONFIELD | LOCATION_REMOVED | LOCATION_EXTRA)) &&
+             (pos & POS_FACEUP))) {
+          note_seen(newloc & 0xff, peek_u32(0));
+        }
+      }
+      break;
+    case MSG_POS_CHANGE:
+      if (avail(9) && (data_[dp_ + 8] & POS_FACEUP)) {
+        note_seen(peek_u32(4) & 0xff, peek_u32(0));
+      }
+      break;
+    case MSG_CONFIRM_CARDS:
+    case MSG_CONFIRM_DECKTOP:
+    case MSG_CONFIRM_EXTRATOP: {
+      // player u8, count u8, then {code u32, controller u8, location u8, sequence u8}
+      int off = 1;
+      if (!avail(off + 1)) break;
+      int n = data_[dp_ + off];
+      off += 1;
+      for (int i = 0; i < n && avail(off + 7); ++i, off += 7) {
+        note_seen(data_[dp_ + off + 4], peek_u32(off));
+      }
+      break;
+    }
+    default:
+      break;
+    }
+  }
+
+  // Candidates for a card-name declaration, in priority order, capped at
+  // max_options: codes named by the script, codes the opponent revealed this
+  // duel (most recent first), codes this player revealed, this player's deck
+  // list, then every loaded deck's codes by deck count. Only codes the core
+  // accepts (is_declarable) and that have a card id are offered.
+  std::vector<CardCode>
+  announce_card_candidates(PlayerId player,
+                           const std::vector<uint32_t> &opcodes) const {
+    const size_t cap = max_options();
+    std::vector<CardCode> out;
+    ankerl::unordered_dense::set<CardCode> added;
+    auto try_add = [&](CardCode code) {
+      if (out.size() >= cap || code == 0 || added.count(code)) {
+        return;
+      }
+      if (card_ids_.find(code) == card_ids_.end()) {
+        return;
+      }
+      auto it = cards_data_.find(code);
+      if (it == cards_data_.end() || !is_declarable_env(it->second, opcodes)) {
+        return;
+      }
+      added.insert(code);
+      out.push_back(code);
+    };
+
+    for (size_t i = 1; i < opcodes.size(); ++i) {
+      if (opcodes[i] == OPCODE_ISCODE && opcodes[i - 1] < OPCODE_ADD) {
+        try_add(opcodes[i - 1]);
+      }
+    }
+    const auto &oppo_seen = seen_codes_[1 - player];
+    for (auto it = oppo_seen.rbegin(); it != oppo_seen.rend(); ++it) {
+      try_add(*it);
+    }
+    const auto &own_seen = seen_codes_[player];
+    for (auto it = own_seen.rbegin(); it != own_seen.rend(); ++it) {
+      try_add(*it);
+    }
+    if (out.size() < cap) {
+      const auto &md = player == 0 ? main_deck0_ : main_deck1_;
+      const auto &ed = player == 0 ? extra_deck0_ : extra_deck1_;
+      ankerl::unordered_dense::set<CardCode> own(md.begin(), md.end());
+      own.insert(ed.begin(), ed.end());
+      for (auto c : pool_codes_ranked_) {
+        if (own.count(c)) {
+          try_add(c);
+        }
+      }
+      for (auto c : own) {  // own cards outside the pool (not expected)
+        try_add(c);
+      }
+    }
+    for (auto c : pool_codes_ranked_) {
+      if (out.size() >= cap) break;
+      try_add(c);
+    }
+    if (out.empty()) {
+      for (auto c : code_list_order_) {
+        if (out.size() >= cap) break;
+        try_add(c);
+      }
+    }
+    if (out.empty()) {
+      throw std::runtime_error(fmt::format(
+          "[announce_card] no declarable card for opcodes {}", opcodes));
+    }
+    return out;
+  }
+
   void handle_message() {
     msg_ = int(data_[dp_++]);
     legal_actions_ = {};
+    track_seen_codes();
 
     if (verbose_) {
       fmt::println("Message {}, length {}, dp {}", msg_to_string(msg_), dl_, dp_);
@@ -5222,7 +5451,7 @@ private:
         opcodes.push_back(read_u32());
       }
 
-      auto codes = parse_codes_from_opcodes(opcodes);
+      auto codes = announce_card_candidates(player, opcodes);
 
       if (verbose_) {
         auto& pl = players_[player];
