@@ -467,7 +467,8 @@ static std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, std::vector<uint
         break;
       }
       // Check if line contains only digits
-      if (std::all_of(line.begin(), line.end(), ::isdigit)) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (!line.empty() && std::all_of(line.begin(), line.end(), ::isdigit)) {
         main_deck.push_back(std::stoul(line));
       }
     }
@@ -479,7 +480,8 @@ static std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, std::vector<uint
           break;
         }
         // Check if line contains only digits
-        if (std::all_of(line.begin(), line.end(), ::isdigit)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty() && std::all_of(line.begin(), line.end(), ::isdigit)) {
           extra_deck.push_back(std::stoul(line));
         }
       }
@@ -488,7 +490,8 @@ static std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, std::vector<uint
     // Read the side deck
     while (std::getline(file, line)) {
       // Check if line contains only digits
-      if (std::all_of(line.begin(), line.end(), ::isdigit)) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (!line.empty() && std::all_of(line.begin(), line.end(), ::isdigit)) {
         side_deck.push_back(std::stoul(line));
       }
     }
