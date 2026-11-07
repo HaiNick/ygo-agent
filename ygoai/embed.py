@@ -2,6 +2,7 @@ from typing import List, Union
 from dataclasses import dataclass
 
 import sqlite3
+import sys
 
 import pandas as pd
 
@@ -176,5 +177,11 @@ def read_cards(cards_path):
     merged_df = pd.merge(texts_df, datas_df, on='id')
 
     cards_data = merged_df.to_dict('records')
-    cards = [parse_card(data) for data in cards_data]
+    cards = []
+    for data in cards_data:
+        try:
+            cards.append(parse_card(data))
+        except ValueError as e:
+            # e.g. token-only entries (type == TYPE_TOKEN) in newer databases
+            print(f"read_cards: skipping {data['id']} ({data['name']}): {e}", file=sys.stderr)
     return merged_df, cards
