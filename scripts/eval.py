@@ -11,7 +11,7 @@ import numpy as np
 import tyro
 
 from ygoai.utils import init_ygopro
-from ygoai.rl.utils import RecordEpisodeStatistics
+from ygoai.rl.utils import RecordEpisodeStatistics, EnvPreprocess
 from ygoai.rl.jax.agent import RNNAgent, ModelArgs
 
 
@@ -63,6 +63,10 @@ class Args:
 
     checkpoint: Optional[str] = None
     """the checkpoint to load, must be a `flax_model` file"""
+    skip_mask: bool = True
+    """set obs['mask_'] to None, as battle.py and cleanba.py do. Without oppo_info the
+    env leaves mask_ all zero, and a zero mask makes the card encoder replace every
+    card's features with the padding slot, so the agent cannot see any cards."""
 
     xla_device: Optional[str] = None
     """the XLA device to use, `cpu` for forcing running on CPU"""
@@ -123,6 +127,7 @@ if __name__ == "__main__":
     )
     obs_space = envs.observation_space
     envs.num_envs = num_envs
+    envs = EnvPreprocess(envs, skip_mask=args.skip_mask)
     envs = RecordEpisodeStatistics(envs)
 
     if args.checkpoint:
