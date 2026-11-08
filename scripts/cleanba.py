@@ -1,5 +1,6 @@
 import os
 import shutil
+import signal
 import queue
 import random
 import threading
@@ -62,6 +63,8 @@ class Args:
     """the name of the tensorboard run"""
     ckpt_dir: str = "checkpoints"
     """the directory to save the model checkpoints"""
+    n_saved: int = 2
+    """the number of checkpoints to keep in ckpt_dir; 0 keeps all"""
 
     # Algorithm specific arguments
     env_id: str = "YGOPro-v1"
@@ -707,11 +710,14 @@ def main():
         writer = dummy_writer
 
     def save_fn(obj, path):
-        with open(path, "wb") as f:
+        # write then rename, so an interrupted save never leaves a truncated file
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
             f.write(flax.serialization.to_bytes(obj))
+        os.replace(tmp, path)
 
     ckpt_maneger = ModelCheckpoint(
-        args.ckpt_dir, save_fn, n_saved=2)
+        args.ckpt_dir, save_fn, n_saved=args.n_saved)
 
     # seeding
     random.seed(args.seed)
@@ -1111,6 +1117,19 @@ def main():
 
     rollout_queue_get_time = deque(maxlen=10)
     learner_policy_version = 0
+
+    # Clean stop: SIGINT / SIGTERM or a file named STOP in ckpt_dir. The learner
+    # finishes the current iteration, saves a checkpoint and exits.
+    stop_file = os.path.join(args.ckpt_dir, "STOP")
+    stop_requested = threading.Event()
+
+    def request_stop(signum, frame):
+        print(f"signal {signum}: stopping after the current iteration", flush=True)
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
     while True:
         learner_policy_version += 1
         rollout_queue_get_time_start = time.time()
@@ -1186,11 +1205,22 @@ def main():
             writer.add_scalar("losses/approx_kl", approx_kl[-1].item(), tb_global_step)
             writer.add_scalar("losses/loss", loss, tb_global_step)
 
+        saved_now = False
         if args.local_rank == 0 and learner_policy_version % args.save_interval == 0 and not args.debug:
             ckpt_steps = tb_global_step // 2**20
             step_str = "M"
             ckpt_name = f"{timestamp}_{ckpt_steps}{step_str}.flax_model"
             ckpt_maneger.save(unreplicated_params, ckpt_name)
+            saved_now = True
+
+        if stop_requested.is_set() or os.path.exists(stop_file):
+            if args.local_rank == 0 and not args.debug and not saved_now:
+                ckpt_name = f"{timestamp}_{tb_global_step // 2**20}M_iter{learner_policy_version}.flax_model"
+                ckpt_maneger.save(unreplicated_params, ckpt_name)
+            print(f"stop requested: saved checkpoint at iteration {learner_policy_version}, exiting", flush=True)
+            writer.close()
+            # actor threads are not daemons and run until num_updates; end the process
+            os._exit(0)
 
         if learner_policy_version >= args.num_updates:
             break

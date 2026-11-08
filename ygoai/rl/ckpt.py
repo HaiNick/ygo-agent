@@ -39,7 +39,7 @@ class ModelCheckpoint(object):
         self._saved.append(path)
         print(f"Saved model to {path}")
 
-        if len(self._saved) > self._n_saved:
+        if self._n_saved > 0 and len(self._saved) > self._n_saved:  # n_saved <= 0 keeps all
             to_remove = self._saved.pop(0)
             if to_remove != path:
                 if to_remove.is_dir():
