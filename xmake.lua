@@ -5,7 +5,7 @@ add_requireconfs("**.lua", {version = "5.4.6", override = true})
 add_requires("edopro-core", {optional = true})
 
 add_requires(
-    "ygopro-core 0.0.2", "pybind11 2.13.*", "fmt 10.2.*", "glog 0.6.0",
+    "ygopro-core 0.0.3", "pybind11 2.13.*", "fmt 10.2.*", "glog 0.6.0",
     "sqlite3 3.43.0+200", "concurrentqueue 1.0.4", "unordered_dense 4.4.*",
     "sqlitecpp 3.2.1")
 
@@ -26,6 +26,15 @@ target("ygopro0_ygoenv")
         os.cp(target:targetfile(), install_target)
         print("Copy target to " .. install_target)
     end)
+
+
+target("core_lua_probe")
+    -- test helper: run a Lua file in a core duel (tools/check_category_sset.py)
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/core_lua_probe.cpp")
+    add_packages("ygopro-core")
+    set_languages("c++17")
 
 
 target("ygopro_ygoenv")
