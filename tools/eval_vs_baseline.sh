@@ -10,6 +10,10 @@
 #             NUM_EMBEDDINGS = 15017, DECK_DIR = ~/ygo/decks/mine,
 #             OUT_MD = ~/ygo/evals/<ckpt>_vs_<baseline>.md
 #   env: N_GAMES (128), SEED (0)
+#        QUICK=1  only the quick-check subset: the base deck plus three new
+#                 archetypes (Artmage_PowerPatron, Blitzclique_A, Elfnote_KewlTune)
+#        ONLY="DeckA DeckB"  only these decks (file names without .ydk)
+#   For use while training runs: XLA_PYTHON_CLIENT_PREALLOCATE=false
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,6 +25,9 @@ cn="$(basename "$CKPT" .flax_model)"; bn="$(basename "$BASE" .flax_model)"
 OUT="$(realpath -m "${5:-$HOME/ygo/evals/${cn}_vs_${bn}.md}")"
 N_GAMES="${N_GAMES:-128}"
 SEED="${SEED:-0}"
+QUICK_DECKS="00_Base_Branded-Despia Artmage_PowerPatron Blitzclique_A Elfnote_KewlTune"
+ONLY="${ONLY:-}"
+[[ "${QUICK:-0}" == 1 && -z "$ONLY" ]] && ONLY="$QUICK_DECKS"
 LOGDIR="$(dirname "$OUT")/logs_${cn}_vs_${bn}"
 mkdir -p "$LOGDIR"
 
@@ -28,7 +35,15 @@ source "$HOME/ygo/.venv/bin/activate"
 cd "$REPO/scripts"
 
 shopt -s nullglob
-decks=("$DECKS"/*.ydk)
+if [[ -n "$ONLY" ]]; then
+  decks=()
+  for n in $ONLY; do
+    [[ -f "$DECKS/$n.ydk" ]] || { echo "deck not found: $DECKS/$n.ydk" >&2; exit 1; }
+    decks+=("$DECKS/$n.ydk")
+  done
+else
+  decks=("$DECKS"/*.ydk)
+fi
 (( ${#decks[@]} )) || { echo "no .ydk files in $DECKS" >&2; exit 1; }
 
 rows=()
@@ -61,6 +76,7 @@ mkdir -p "$(dirname "$OUT")"
   echo "- Candidate (agent1): \`$CKPT\`"
   echo "- Baseline (agent2): \`$BASE\`"
   echo "- \`--num_embeddings $NEMB\`, $N_GAMES games per deck (half with each seat), seed $SEED, greedy actions"
+  [[ -n "$ONLY" ]] && echo "- Deck subset: $ONLY"
   echo "- Engine/env commit: \`$(cd "$REPO" && git rev-parse --short HEAD)\`, date $(date -u +%Y-%m-%d)"
   echo
   echo "| Deck | Candidate win rate | as first player | as second player | Avg length | Note |"

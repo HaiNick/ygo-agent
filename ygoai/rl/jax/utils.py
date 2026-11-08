@@ -13,12 +13,12 @@ import numpy as np
 
 def masked_mean(x, valid):
     x = jnp.where(valid, x, jnp.zeros_like(x))
-    return x.sum() / valid.sum()
+    return x.sum() / jnp.maximum(valid.sum(), 1)  # 0 instead of NaN without valid samples
 
 
 def masked_normalize(x, valid, eps=1e-8):
     x = jnp.where(valid, x, jnp.zeros_like(x))
-    n = valid.sum()
+    n = jnp.maximum(valid.sum(), 1)  # no NaN for a minibatch without valid samples
     mean = x.sum() / n
     variance = jnp.square(x - mean).sum() / n
     return (x - mean) / jnp.sqrt(variance + eps)

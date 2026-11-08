@@ -863,7 +863,9 @@ def main():
             mask = jnp.where(burn_in_mask[:, None], 0.0, mask)
             mask = jnp.reshape(mask, (-1,))
 
-        n_valids = jnp.sum(mask)
+        # a minibatch without valid samples gives 0 instead of 0/0 = NaN (which
+        # apply_if_finite would drop, and apply anyway after 10 in a row)
+        n_valids = jnp.maximum(jnp.sum(mask), 1)
         pg_loss, v_loss, ent_loss, approx_kl = jax.tree.map(
             lambda x: jnp.sum(x * mask) / n_valids, (pg_loss, v_loss, ent_loss, approx_kl))
 
