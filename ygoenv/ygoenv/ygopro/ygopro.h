@@ -38,6 +38,17 @@
 #include "ygopro-core/effect.h"
 #include "ygopro-core/card.h"
 
+// ygopro-core >= 0.0.3 no longer defines these aliases; the env still uses them.
+using byte = uint8_t;
+using uint8 = uint8_t;
+using uint16 = uint16_t;
+using uint32 = uint32_t;
+using uint64 = uint64_t;
+using int8 = int8_t;
+using int16 = int16_t;
+using int32 = int32_t;
+using int64 = int64_t;
+
 // clang-format on
 
 namespace ygopro {
@@ -1121,7 +1132,8 @@ public:
     controler_ = location & 0xff;
     location_ = (location >> 8) & 0xff;
     sequence_ = (location >> 16) & 0xff;
-    position_ = (location >> 24) & 0xff;
+    // core 0.0.3 may set POS_REVEAL (0x80) for cards revealed on the field
+    position_ = (location >> 24) & 0xff & ~uint32_t(POS_REVEAL);
   }
 
   const std::string &name() const { return name_; }
@@ -1220,8 +1232,29 @@ inline card_data db_query_card_data(const SQLite::Database &db, CardCode code) {
   card.code = code;
   card.alias = query.getColumn("alias");
   uint64_t setcode = query.getColumn("setcode").getInt64();
-  card.set_setcode(setcode);
+  write_setcode(card.setcode, setcode);
   card.type = query.getColumn("type");
+  // Same split as the reference client (ygopro gframe/data_manager.cpp): an
+  // alias that is not an alternative artwork is a rule code ("treated as").
+  // Alternative artworks inherit their base card's rule code in init_module.
+  auto is_alternative = [](uint32_t c, uint32_t a) {
+    constexpr uint32_t kArtworkVersionsOffset = 20;
+    return a && (a < c + kArtworkVersionsOffset) && (c < a + kArtworkVersionsOffset);
+  };
+  if (code == 5405695 ||
+      (card.alias && !(card.type & TYPE_TOKEN) && !is_alternative(code, card.alias))) {
+    card.rule_code = card.alias;
+    card.alias = 0;
+  }
+  // cards with more set codes than the database column holds (reference client)
+  static const std::map<uint32_t, std::vector<uint16_t>> extra_setcode = {
+    {8512558u, {0x8f, 0x54, 0x59, 0x82, 0x13a}},
+    {55088578u, {0x8f, 0x54, 0x59, 0x82, 0x13a}},
+  };
+  auto es = extra_setcode.find(code);
+  if (es != extra_setcode.end()) {
+    std::copy(es->second.begin(), es->second.end(), card.setcode);
+  }
   uint32_t level_ = query.getColumn("level");
   card.level = level_ & 0xff;
   card.lscale = (level_ >> 24) & 0xff;
@@ -1420,11 +1453,14 @@ inline uint32 message_handler_callback(intptr_t pduel, uint32 msg_type) {
   return 0;
 }
 
-// Port of ygopro-core playerop.cpp is_declarable() (core 0.0.2). The env must
+// Port of ygopro-core playerop.cpp is_declarable() (core 0.0.3). The env must
 // only offer codes the core accepts: a rejected code makes the core answer
 // MSG_RETRY, which the env treats as fatal. Keep this in sync with the core.
 inline bool is_declarable_env(const card_data &cd,
                               const std::vector<uint32_t> &opcode) {
+  if (cd.alias) {
+    return false;
+  }
   std::vector<int32_t> stack;
   auto pop = [&stack]() {
     int32_t v = stack.back();
@@ -1499,9 +1535,10 @@ inline bool is_declarable_env(const card_data &cd,
   if (stack.size() != 1 || stack.back() == 0) {
     return false;
   }
-  return cd.code == CARD_MARINE_DOLPHIN || cd.code == CARD_TWINKLE_MOSS ||
-         (!cd.alias && (cd.type & (TYPE_MONSTER | TYPE_TOKEN)) !=
-                           (TYPE_MONSTER | TYPE_TOKEN));
+  if (!second_code.count(cd.code) && (cd.rule_code || (cd.type & TYPE_TOKEN))) {
+    return false;
+  }
+  return true;
 }
 
 static void init_module(const std::string &db_path,
@@ -1533,6 +1570,16 @@ static void init_module(const std::string &db_path,
       std::string path = "./script/c" + std::to_string(code) + ".lua";
       byte *buf = read_card_script(path, &script_len);
       cards_script_[path] = {buf, script_len};
+    }
+  }
+
+  for (auto &[c, cd] : cards_data_) {
+    if (cd.rule_code || !cd.alias || (cd.type & TYPE_TOKEN)) {
+      continue;
+    }
+    auto it = cards_data_.find(cd.alias);
+    if (it != cards_data_.end()) {
+      cd.rule_code = it->second.rule_code;
     }
   }
 
@@ -1851,7 +1898,7 @@ protected:
   byte query_buf_[4096];
   int qdp_ = 0;
 
-  byte resp_buf_[128];
+  byte resp_buf_[SIZE_RETURN_VALUE] = {};
 
   using IdleCardSpec = std::tuple<CardCode, std::string, uint32_t>;
 
@@ -1869,6 +1916,11 @@ protected:
   std::unordered_set<std::string> revealed_;
   // codes each player has shown publicly this duel, most recent at the back
   std::vector<CardCode> seen_codes_[2];
+  // codes shown by MSG_CONFIRM_* in the current chain, per (controller << 8 | location).
+  // Matched by code: select messages rewrite deck sequences to hide deck order.
+  std::unordered_map<uint32_t, std::vector<CardCode>> confirmed_locs_;
+  // current selection: spec -> code for confirmed cards the observation has no slot for
+  std::unordered_map<std::string, CardCode> confirmed_spec_codes_;
 
   // multi select
   int ms_idx_ = -1;
@@ -1999,6 +2051,8 @@ public:
     ms_idx_ = -1;
     seen_codes_[0].clear();
     seen_codes_[1].clear();
+    confirmed_locs_.clear();
+    confirmed_spec_codes_.clear();
 
     history_actions_1_.Zero();
     history_actions_2_.Zero();
@@ -2527,6 +2581,18 @@ public:
       action.msg_ = msg_;
       const auto &spec = action.spec_;
       if (!spec.empty()) {
+        auto hint = confirmed_spec_codes_.find(spec);
+        if (hint != confirmed_spec_codes_.end()) {
+          // Card confirmed to this player this chain (e.g. opponent deck top):
+          // its identity is known even if the card observation hides it or has
+          // no slot for it.
+          auto it = spec_infos.find(spec);
+          action.spec_index_ = it != spec_infos.end() ? it->second.index : 0;
+          if (action.cid_ == 0) {
+            action.cid_ = c_get_card_id(hint->second);
+          }
+          continue;
+        }
         const auto& spec_info = find_spec_info(spec_infos, spec);
         action.spec_index_ = spec_info.index;
         if (action.cid_ == 0) {
@@ -3013,11 +3079,14 @@ private:
 
   // ygopro-core API
   intptr_t YGO_CreateDuel(uint32_t seed) {
+    // Use the core API so end_duel() frees the duel (it only deletes duels
+    // registered by create_duel*). v2 = the reference server's RNG.
     std::mt19937 rnd(seed);
-    // return create_duel(rnd());
-    duel* pduel = new duel();
-    pduel->random.reset(rnd());
-    return (intptr_t)pduel;
+    uint32_t seed_sequence[SEED_COUNT];
+    for (auto &s : seed_sequence) {
+      s = rnd();
+    }
+    return create_duel_v2(seed_sequence);
   }
 
   void YGO_SetPlayerInfo(intptr_t pduel, int32 playerid, int32 lp, int32 startcount, int32 drawcount) const {
@@ -3033,9 +3102,7 @@ private:
   }
 
   void YGO_EndDuel(intptr_t pduel) const {
-    // end_duel(pduel);
-    duel* pd = (duel*)pduel;
-    delete pd;
+    end_duel(pduel);  // erases from the core's duel registry and deletes
   }
 
   int32 YGO_GetMessage(intptr_t pduel, byte* buf) {
@@ -3456,6 +3523,21 @@ private:
     v.push_back(code);
   }
 
+  // Opponent deck cards are not part of the card observation; if a selection
+  // offers one that was confirmed this chain, remember its code for the action.
+  void note_confirmed_spec(uint32_t c, uint32_t loc, uint32_t seq,
+                           const std::string &spec, CardCode code) {
+    if (loc != LOCATION_DECK && loc != LOCATION_EXTRA) {
+      return;
+    }
+    (void)seq;
+    auto it = confirmed_locs_.find((c << 8) | loc);
+    if (it != confirmed_locs_.end() &&
+        std::find(it->second.begin(), it->second.end(), code) != it->second.end()) {
+      confirmed_spec_codes_[spec] = code;
+    }
+  }
+
   uint32_t peek_u32(int off) const {
     uint32_t v;
     std::memcpy(&v, data_ + dp_ + off, 4);
@@ -3494,13 +3576,17 @@ private:
     case MSG_CONFIRM_CARDS:
     case MSG_CONFIRM_DECKTOP:
     case MSG_CONFIRM_EXTRATOP: {
-      // player u8, count u8, then {code u32, controller u8, location u8, sequence u8}
-      int off = 1;
+      // player u8, [skip_panel u8 for CONFIRM_CARDS], count u8,
+      // then {code u32, controller u8, location u8, sequence u8}
+      int off = msg_ == MSG_CONFIRM_CARDS ? 2 : 1;
       if (!avail(off + 1)) break;
       int n = data_[dp_ + off];
       off += 1;
       for (int i = 0; i < n && avail(off + 7); ++i, off += 7) {
-        note_seen(data_[dp_ + off + 4], peek_u32(off));
+        uint32_t c = data_[dp_ + off + 4], l = data_[dp_ + off + 5], q = data_[dp_ + off + 6];
+        note_seen(c, peek_u32(off));
+        (void)q;
+        confirmed_locs_[(c << 8) | l].push_back(peek_u32(off));
       }
       break;
     }
@@ -3582,6 +3668,7 @@ private:
   void handle_message() {
     msg_ = int(data_[dp_++]);
     legal_actions_ = {};
+    confirmed_spec_codes_.clear();  // hints belong to one decision
     track_seen_codes();
 
     if (verbose_) {
@@ -4015,6 +4102,7 @@ private:
       }
     } else if (msg_ == MSG_CONFIRM_CARDS) {
       auto player = read_u8();
+      read_u8();  // skip_panel (core 0.0.3)
       auto size = read_u8();
       std::vector<Card> cards;
       for (int i = 0; i < size; ++i) {
@@ -4266,6 +4354,7 @@ private:
     } else if (msg_ == MSG_CHAIN_SOLVED) {
       dp_ = dl_;
       revealed_.clear();
+      confirmed_locs_.clear();
     } else if (msg_ == MSG_CHAIN_SOLVING) {
       dp_ = dl_;
     } else if (msg_ == MSG_CHAINED) {
@@ -4607,6 +4696,7 @@ private:
 
       std::vector<std::string> specs;
       specs.reserve(size);
+      confirmed_spec_codes_.clear();
       if (verbose_) {
         std::vector<Card> cards;
         for (int i = 0; i < size; ++i) {
@@ -4622,6 +4712,7 @@ private:
         for (const auto &card : cards) {
           auto spec = card.get_spec(player);
           specs.push_back(spec);
+          note_confirmed_spec(card.controler_, card.location_, card.sequence_, spec, card.code_);
           int i = specs.size();
           if (card.controler_ != player && card.position_ & POS_FACEDOWN) {
             pl->notify(
@@ -4633,13 +4724,14 @@ private:
         }
       } else {
         for (int i = 0; i < size; ++i) {
-          dp_ += 4;
+          CardCode code = read_u32();
           auto controller = read_u8();
           auto loc = read_u8();
           auto seq = read_u8();
           auto pos = read_u8();
           auto spec = ls_to_spec(loc, seq, pos, controller != player);
           specs.push_back(spec);
+          note_confirmed_spec(controller, loc, seq, spec, code);
         }
       }
 
@@ -4762,7 +4854,7 @@ private:
       // ritual summoning mode 1 (max)
       auto mode = read_u8();
       auto player = read_u8();
-      auto val = read_u32();
+      auto val = read_u32() & 0xffff;  // core 0.0.2 masked acc; 0.0.3 does not
       int _min = read_u8();
       int _max = read_u8();
       auto must_select_size = read_u8();
@@ -4889,7 +4981,7 @@ private:
       auto player = read_u8();
       auto size = read_u8();
       auto spe_count = read_u8();
-      bool forced = read_u8();
+      bool forced = false;  // core 0.0.3: per-chain forced flag, see below
       dp_ += 8;
       // auto hint_timing = read_u32();
       // auto other_timing = read_u32();
@@ -4899,6 +4991,8 @@ private:
       std::vector<std::string> specs;
       for (int i = 0; i < size; ++i) {
         auto flag = read_u8();
+        bool entry_forced = read_u8() != 0;  // always consume the byte
+        forced = forced || entry_forced;
         CardCode code = read_u32();
         codes.push_back(code);
         PlayerId c = read_u8();
