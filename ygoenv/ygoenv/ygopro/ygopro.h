@@ -35,6 +35,8 @@
 #include "ygopro-core/duel.h"
 #include "ygopro-core/ocgapi.h"
 #include <lzma.h>
+#include "ygoenv/ygopro/crash_info.h"
+#include "ygoenv/ygopro/duel_registry.h"
 #include "ygopro-core/field.h"
 #include "ygopro-core/effect.h"
 #include "ygopro-core/card.h"
@@ -1563,6 +1565,18 @@ inline bool is_declarable_env(const card_data &cd,
 static void init_module(const std::string &db_path,
                         const std::string &code_list_file,
                         const std::map<std::string, std::string> &decks) {
+  // Without ./script no card has any effect, and the env would still run
+  // (every initial_effect fails with a Lua error). Refuse to start instead.
+  for (const char *f : {"./script/constant.lua", "./script/utility.lua", "./script/procedure.lua"}) {
+    if (!std::filesystem::exists(f)) {
+      throw std::runtime_error(fmt::format(
+          "[init_module] card scripts not found: {} (cwd: {}). Run from scripts/ "
+          "or link ./script to ygopro-scripts.",
+          f, std::filesystem::current_path().string()));
+    }
+  }
+  ygo_crash::install_from_env();
+
   // parse code from code_list_file
   SQLite::Database db(db_path, SQLite::OPEN_READONLY);
 
@@ -1573,6 +1587,7 @@ static void init_module(const std::string &db_path,
   int i = 0;
   CardCode code;
   int has_script, script_len;
+  std::vector<CardCode> missing_scripts;
   code_list_order_.clear();
   while (std::getline(file, line)) {
     i++;
@@ -1588,8 +1603,18 @@ static void init_module(const std::string &db_path,
     if (has_script) {
       std::string path = "./script/c" + std::to_string(code) + ".lua";
       byte *buf = read_card_script(path, &script_len);
+      if (buf == nullptr) {
+        missing_scripts.push_back(code);
+      }
       cards_script_[path] = {buf, script_len};
     }
+  }
+  if (!missing_scripts.empty()) {
+    throw std::runtime_error(fmt::format(
+        "[init_module] {} card scripts listed in {} are missing under ./script (first: {})",
+        missing_scripts.size(), code_list_file,
+        std::vector<CardCode>(missing_scripts.begin(),
+                              missing_scripts.begin() + std::min<size_t>(5, missing_scripts.size()))));
   }
 
   for (auto &[c, cd] : cards_data_) {
@@ -1856,8 +1881,19 @@ constexpr int32_t duel_options_ = ((rules_ & 0xFF) << 16) + (0 & 0xFFFF);
 
 
 class YGOProEnvImpl {
+public:
+  // slot in the crash-info table (process-wide, see crash_info.h) and env id
+  void set_crash_slot(int slot, int env_id) {
+    crash_slot_ = slot;
+    crash_env_id_ = env_id;
+  }
+
 protected:
   const EnvSpec<YGOProEnvFns> spec_;
+  int crash_slot_ = -1;
+  int crash_env_id_ = -1;
+  std::string crash_info_;
+  uint64_t episode_count_ = 0;
 
   constexpr static int init_lp_ = 8000;
   constexpr static int startcount_ = 5;
@@ -2092,6 +2128,7 @@ public:
     if (duel_started_) {
       YGO_EndDuel(pduel_);
     }
+    ygo_crash::mark_thread(crash_slot_);
     MDuel mduel;
     mduel = new_duel(dist_int_(gen_));
 
@@ -2104,6 +2141,17 @@ public:
     extra_deck0_ = mduel.extra_deck0;
     main_deck1_ = mduel.main_deck1;
     extra_deck1_ = mduel.extra_deck1;
+
+    ++episode_count_;
+    if (crash_slot_ >= 0) {
+      const auto *q = mduel.seed_seq;
+      crash_info_ = fmt::format(
+          "slot {} env {} episode {}: decks {} vs {}, duel seed {}, seed_sequence "
+          "{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}, play_mode {}",
+          crash_slot_, crash_env_id_, episode_count_, deck_name_[0], deck_name_[1], (uint32_t)duel_seed,
+          q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], (int)play_mode_);
+      ygo_crash::set_slot(crash_slot_, "%s, turn 0", crash_info_.c_str());
+    }
 
     for (PlayerId i = 0; i < 2; i++) {
       std::string nickname = i == 0 ? "Alice" : "Bob";
@@ -2430,6 +2478,7 @@ public:
   }
 
   void step(int idx) {
+    ygo_crash::mark_thread(crash_slot_);
     callback_(idx);
     update_history_actions(to_play_, legal_actions_[idx]);
 
@@ -3154,13 +3203,13 @@ private:
 
   // ygopro-core API
   intptr_t YGO_CreateDuel(uint32_t seed, uint32_t (&seed_sequence)[SEED_COUNT]) {
-    // Use the core API so end_duel() frees the duel (it only deletes duels
-    // registered by create_duel*). v2 = the reference server's RNG.
+    // create_duel_v2 (the reference server's RNG) through the registry lock:
+    // the core's duel registry is a global std::set shared by all env threads.
     std::mt19937 rnd(seed);
     for (auto &s : seed_sequence) {
       s = rnd();
     }
-    return create_duel_v2(seed_sequence);
+    return ygo_registry::create_duel(seed_sequence);
   }
 
   void YGO_SetPlayerInfo(intptr_t pduel, int32 playerid, int32 lp, int32 startcount, int32 drawcount) const {
@@ -3176,7 +3225,7 @@ private:
   }
 
   void YGO_EndDuel(intptr_t pduel) const {
-    end_duel(pduel);  // erases from the core's duel registry and deletes
+    ygo_registry::end_duel(pduel);  // erases from the registry (locked) and deletes
   }
 
   int32 YGO_GetMessage(intptr_t pduel, byte* buf) {
@@ -3772,6 +3821,9 @@ private:
     } else if (msg_ == MSG_NEW_TURN) {
       tp_ = int(read_u8());
       turn_count_++;
+      if (crash_slot_ >= 0) {
+        ygo_crash::set_slot(crash_slot_, "%s, turn %d", crash_info_.c_str(), turn_count_);
+      }
       if (!verbose_) {
         return;
       }
@@ -5750,6 +5802,7 @@ public:
         dist_int_(0, 0xffffffff) {
     env_impls_.reserve(max_timeout_);
     env_impls_.emplace_back(spec, dist_int_(gen_));
+    env_impls_.back().set_crash_slot(ygo_crash::allocate_slot(), env_id_);
   }
 
   bool IsDone() override { return done_; }
@@ -5767,6 +5820,7 @@ public:
 
   void handle_timeout() {
     env_impls_.emplace_back(spec_, dist_int_(gen_));
+    env_impls_.back().set_crash_slot(ygo_crash::allocate_slot(), env_id_);
     if (env_impls_.capacity() > max_timeout_) {
       throw std::runtime_error("Too many timeouts");
     }

@@ -37,6 +37,16 @@ target("core_lua_probe")
     set_languages("c++17")
 
 
+target("duel_registry_stress")
+    -- regression test: concurrent duel create/end (core registry race)
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/duel_registry_stress.cpp")
+    add_packages("ygopro-core")
+    add_includedirs("ygoenv")
+    set_languages("c++17")
+
+
 target("yrp_verify")
     -- test helper: replay a .yrp through the core like the reference client
     set_kind("binary")
