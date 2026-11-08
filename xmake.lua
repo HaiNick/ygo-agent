@@ -7,7 +7,7 @@ add_requires("edopro-core", {optional = true})
 add_requires(
     "ygopro-core 0.0.3", "pybind11 2.13.*", "fmt 10.2.*", "glog 0.6.0",
     "sqlite3 3.43.0+200", "concurrentqueue 1.0.4", "unordered_dense 4.4.*",
-    "sqlitecpp 3.2.1")
+    "sqlitecpp 3.2.1", "xz 5.8.1")
 
 
 target("ygopro0_ygoenv")
@@ -37,10 +37,19 @@ target("core_lua_probe")
     set_languages("c++17")
 
 
+target("yrp_verify")
+    -- test helper: replay a .yrp through the core like the reference client
+    set_kind("binary")
+    set_default(false)
+    add_files("tests/yrp_verify.cpp")
+    add_packages("ygopro-core", "xz", "sqlite3")
+    set_languages("c++17")
+
+
 target("ygopro_ygoenv")
     add_rules("python.library")
     add_files("ygoenv/ygoenv/ygopro/*.cpp")
-    add_packages("pybind11", "fmt", "glog", "concurrentqueue", "sqlitecpp", "unordered_dense", "ygopro-core")
+    add_packages("pybind11", "fmt", "glog", "concurrentqueue", "sqlitecpp", "unordered_dense", "ygopro-core", "xz")
     set_languages("c++17")
     if is_mode("release") then
         set_policy("build.optimization.lto", true)

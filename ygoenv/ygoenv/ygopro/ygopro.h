@@ -34,6 +34,7 @@
 #include "ygopro-core/card_data.h"
 #include "ygopro-core/duel.h"
 #include "ygopro-core/ocgapi.h"
+#include <lzma.h>
 #include "ygopro-core/field.h"
 #include "ygopro-core/effect.h"
 #include "ygopro-core/card.h"
@@ -975,8 +976,14 @@ inline std::string time_now() {
 #define REPLAY_SINGLE_MODE	0x8
 #define REPLAY_UNIFORM		0x10
 
+// replay ids
+#define REPLAY_ID_YRP1	0x31707279
+#define REPLAY_ID_YRP2	0x32707279
+// PRO_VERSION of the reference client (Fluorohydride/ygopro gframe/config.h)
+constexpr uint32_t YGOPRO_REPLAY_VERSION = 0x1362;
+
 // max size
-#define MAX_REPLAY_SIZE	0x20000
+#define MAX_REPLAY_SIZE	0x80000
 
 
 struct ReplayHeader {
@@ -991,6 +998,17 @@ struct ReplayHeader {
 	ReplayHeader()
 		: id(0), version(0), flag(0), seed(0), datasize(0), start_time(0), props{ 0 } {}
 };
+
+// yrp2: the duel is created with create_duel_v2(seed_sequence)
+struct ExtendedReplayHeader {
+	ReplayHeader base;
+	uint32_t seed_sequence[SEED_COUNT]{};
+	uint8_t header_version{ 1 };
+	uint8_t value[15]{};
+};
+static_assert(sizeof(ReplayHeader) == 32, "ReplayHeader size");
+static_assert(sizeof(ExtendedReplayHeader) == 80, "ExtendedReplayHeader size");
+constexpr size_t MAX_COMP_SIZE = UINT16_MAX - 1 - sizeof(ExtendedReplayHeader);
 
 // from ygopro/gframe/replay.h
 
@@ -1175,6 +1193,7 @@ public:
 struct MDuel {
   intptr_t pduel;
   uint64_t seed;
+  uint32_t seed_seq[SEED_COUNT] = {};  // passed to create_duel_v2; written to yrp2 replays
   std::vector<CardCode> main_deck0;
   std::vector<CardCode> extra_deck0;
   std::string deck_name0;
@@ -1938,7 +1957,13 @@ protected:
 
   // replay
   bool record_ = false;
-  FILE* fp_ = nullptr;
+  // Replay being recorded: yrp2 header plus body (names, duel parameters,
+  // decks, responses). Kept in memory and written only when the duel ends with
+  // MSG_WIN, so duels cut off by a reset never leave a file.
+  ExtendedReplayHeader replay_header_;
+  std::vector<uint8_t> replay_data_;
+  std::string replay_time_str_;
+  uint32_t replay_id4_ = 0;
   bool is_recording = false;
 
   // MSG_SELECT_COUNTER
@@ -2010,8 +2035,10 @@ public:
   // }
 
   MDuel new_duel(uint32_t seed) {
-    auto pduel = YGO_CreateDuel(seed);
+    uint32_t seed_seq[SEED_COUNT];
+    auto pduel = YGO_CreateDuel(seed, seed_seq);
     MDuel mduel{pduel, seed};
+    std::copy(std::begin(seed_seq), std::end(seed_seq), mduel.seed_seq);
 
     for (PlayerId i = 0; i < 2; i++) {
       YGO_SetPlayerInfo(pduel, i, init_lp_, startcount_, drawcount_);
@@ -2095,36 +2122,23 @@ public:
     }
 
     if (record_) {
-      if (is_recording && fp_ != nullptr) {
-        fclose(fp_);
-      }
-      auto time_str = time_now();
-      // Use last 4 digits of seed as unique id
-      auto seed_ = duel_seed % 10000;
-      std::string fname;
-      while (true) {
-        fname = fmt::format("./replay/a{} {:04d}.yrp", time_str, seed_);
-        // check existence
-        if (std::filesystem::exists(fname)) {
-          seed_ = (seed_ + 1) % 10000;
-        } else {
-          break;
-        } 
-      }
-      fp_ = fopen(fname.c_str(), "wb");
-      if (!fp_) {
-        throw std::runtime_error("Failed to open file for replay: " + fname);
-      }
-
+      // a previous recording that never reached MSG_WIN is dropped here
+      replay_data_.clear();
+      replay_data_.reserve(0x4000);
+      replay_time_str_ = time_now();
+      // last 4 digits of the seed as unique id (as before)
+      replay_id4_ = duel_seed % 10000;
       is_recording = true;
 
-      ReplayHeader rh;
-      rh.id = 0x31707279;
-      rh.version = 0x00001360;
+      replay_header_ = ExtendedReplayHeader();
+      auto &rh = replay_header_.base;
+      rh.id = REPLAY_ID_YRP2;
+      rh.version = YGOPRO_REPLAY_VERSION;
       rh.flag = REPLAY_UNIFORM;
-      rh.seed = duel_seed;
+      rh.seed = static_cast<uint32_t>(duel_seed);
       rh.start_time = (unsigned int)time(nullptr);
-      fwrite(&rh, sizeof(rh), 1, fp_);
+      std::copy(std::begin(mduel.seed_seq), std::end(mduel.seed_seq),
+                replay_header_.seed_sequence);
 
       for (PlayerId i = 0; i < 2; i++) {
         uint16_t name[20];
@@ -2136,7 +2150,7 @@ public:
         }
         fmt::println("name: {}", name_str);
         str_to_uint16(name_str.c_str(), name);
-        fwrite(name, 40, 1, fp_);
+        ReplayWriteData(name, 40);
       }
 
       ReplayWriteInt32(init_lp_);
@@ -2491,11 +2505,16 @@ public:
       }
 
       if (record_) {
-        if (!is_recording || fp_ == nullptr) {
+        if (!is_recording) {
           throw std::runtime_error("Recording is not started");
         }
-        fclose(fp_);
+        if (winner_ == 0 || winner_ == 1) {
+          save_replay();
+        } else {
+          fmt::println("[replay] duel ended without a winner, replay not saved");
+        }
         is_recording = false;
+        replay_data_.clear();
       }
     }
 
@@ -3069,20 +3088,75 @@ private:
       dest[strlen(src) + 1] = '\0';
   }
 
-  void ReplayWriteInt8(int8_t value) {
-    fwrite(&value, sizeof(value), 1, fp_);
+  void ReplayWriteData(const void *data, size_t len) {
+    auto p = static_cast<const uint8_t *>(data);
+    replay_data_.insert(replay_data_.end(), p, p + len);
   }
 
-  void ReplayWriteInt32(int32_t value) {
-    fwrite(&value, sizeof(value), 1, fp_);
+  void ReplayWriteInt8(int8_t value) { ReplayWriteData(&value, sizeof(value)); }
+
+  void ReplayWriteInt32(int32_t value) { ReplayWriteData(&value, sizeof(value)); }
+
+  // Same LZMA settings and layout as the reference client (gframe/replay.cpp
+  // Replay::EndRecord / SaveReplay): header, then the LZMA1 raw stream of the body.
+  void save_replay() {
+    if (replay_data_.size() > MAX_REPLAY_SIZE) {
+      fmt::println("[replay] body {} bytes exceeds MAX_REPLAY_SIZE, not saved", replay_data_.size());
+      return;
+    }
+    ExtendedReplayHeader h = replay_header_;
+    h.base.datasize = static_cast<uint32_t>(replay_data_.size());
+    h.base.flag |= REPLAY_COMPRESSED;
+    lzma_options_lzma opt;
+    lzma_lzma_preset(&opt, 5);
+    opt.dict_size = 0x1U << 24;
+    opt.lc = 3;
+    opt.lp = 0;
+    opt.pb = 2;
+    opt.nice_len = 32;
+    opt.mf = LZMA_MF_BT4;
+    opt.ext_flags = 0;
+    lzma_filter filters[2];
+    filters[0].id = LZMA_FILTER_LZMA1EXT;
+    filters[0].options = &opt;
+    filters[1].id = LZMA_VLI_UNKNOWN;
+    filters[1].options = nullptr;
+    if (lzma_properties_encode(&filters[0], h.base.props) != LZMA_OK) {
+      throw std::runtime_error("[replay] lzma_properties_encode failed");
+    }
+    std::vector<uint8_t> comp(MAX_COMP_SIZE);
+    size_t out_pos = 0;
+    lzma_ret lret = lzma_raw_buffer_encode(filters, nullptr, replay_data_.data(), replay_data_.size(),
+                                           comp.data(), &out_pos, comp.size());
+    if (lret != LZMA_OK) {
+      fmt::println("[replay] LZMA encode failed ({}), replay not saved", static_cast<int>(lret));
+      return;
+    }
+    std::string fname;
+    auto id4 = replay_id4_;
+    while (true) {
+      fname = fmt::format("./replay/a{} {:04d}.yrp", replay_time_str_, id4);
+      if (!std::filesystem::exists(fname)) {
+        break;
+      }
+      id4 = (id4 + 1) % 10000;
+    }
+    std::string tmp = fname + ".tmp";
+    FILE *fp = fopen(tmp.c_str(), "wb");
+    if (!fp) {
+      throw std::runtime_error("Failed to open file for replay: " + tmp);
+    }
+    fwrite(&h, sizeof(h), 1, fp);
+    fwrite(comp.data(), out_pos, 1, fp);
+    fclose(fp);
+    std::filesystem::rename(tmp, fname);
   }
 
   // ygopro-core API
-  intptr_t YGO_CreateDuel(uint32_t seed) {
+  intptr_t YGO_CreateDuel(uint32_t seed, uint32_t (&seed_sequence)[SEED_COUNT]) {
     // Use the core API so end_duel() frees the duel (it only deletes duels
     // registered by create_duel*). v2 = the reference server's RNG.
     std::mt19937 rnd(seed);
-    uint32_t seed_sequence[SEED_COUNT];
     for (auto &s : seed_sequence) {
       s = rnd();
     }
@@ -3126,7 +3200,7 @@ private:
   }
 
   void YGO_SetResponsei(intptr_t pduel, int32 value) {
-    if (record_) {
+    if (record_ && is_recording) {
       ReplayWriteInt8(4);
       ReplayWriteInt32(value);
     }
@@ -3134,24 +3208,24 @@ private:
   }
 
   void YGO_SetResponseb(intptr_t pduel, byte* buf) {
-    if (record_) {
+    if (record_ && is_recording) {
       switch (msg_) {
         case MSG_SORT_CARD:
           ReplayWriteInt8(1);
-          fwrite(buf, 1, 1, fp_);
+          ReplayWriteData(buf, 1);
           break;
         case MSG_SELECT_COUNTER:
           ReplayWriteInt8(2 * n_counters_);
-          fwrite(buf, 2 * n_counters_, 1, fp_);
+          ReplayWriteData(buf, 2 * n_counters_);
           break;
         case MSG_SELECT_PLACE:
         case MSG_SELECT_DISFIELD:
           ReplayWriteInt8(3);
-          fwrite(buf, 3, 1, fp_);
+          ReplayWriteData(buf, 3);
           break;
         default:
           ReplayWriteInt8(buf[0] + 1);
-          fwrite(buf, buf[0] + 1, 1, fp_);
+          ReplayWriteData(buf, buf[0] + 1);
           break;
       }
     }
