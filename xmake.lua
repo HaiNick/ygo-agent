@@ -10,24 +10,6 @@ add_requires(
     "sqlitecpp 3.2.1", "xz 5.8.1")
 
 
-target("ygopro0_ygoenv")
-    add_rules("python.library")
-    add_files("ygoenv/ygoenv/ygopro0/*.cpp")
-    add_packages("pybind11", "fmt", "glog", "concurrentqueue", "sqlitecpp", "unordered_dense", "ygopro-core")
-    set_languages("c++17")
-    if is_mode("release") then
-        set_policy("build.optimization.lto", true)
-        add_cxxflags("-march=native")
-    end
-    add_includedirs("ygoenv")
-
-    after_build(function (target)
-        local install_target = "$(projectdir)/ygoenv/ygoenv/ygopro0"
-        os.cp(target:targetfile(), install_target)
-        print("Copy target to " .. install_target)
-    end)
-
-
 target("core_lua_probe")
     -- test helper: run a Lua file in a core duel (tools/check_category_sset.py)
     set_kind("binary")

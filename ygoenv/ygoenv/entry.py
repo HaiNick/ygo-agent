@@ -19,11 +19,6 @@ except ImportError:
   pass
 
 try:
-  import ygoenv.ygopro0.registration  # noqa: F401
-except ImportError:
-  pass
-
-try:
   import ygoenv.edopro.registration  # noqa: F401
 except ImportError:
   pass
