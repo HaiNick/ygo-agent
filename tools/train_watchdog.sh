@@ -6,8 +6,10 @@
 #
 # RUN_DIR holds cmd_args (cleanba.py arguments without --checkpoint and
 # --tb_offset, one per line), init_checkpoint and tb_offset.
-# - attempt 1 starts from init_checkpoint; later attempts from the newest
-#   checkpoint in RUN_DIR/checkpoints, with --tb_offset = last logged global_step
+# - a fresh run folder starts from init_checkpoint. If RUN_DIR/checkpoints
+#   already has a checkpoint (resume with tools/ygo.sh, or a later attempt after
+#   a crash), training starts from the newest one, with --tb_offset = last
+#   logged global_step
 # - exit code 0 (normal end, STOP file or Ctrl-C clean stop) ends the watchdog
 # - an abnormal exit is logged to RUN_DIR/watchdog.log; after 30 s training
 #   resumes, unless RUN_DIR/checkpoints/STOP exists or this was the 3rd crash
@@ -39,13 +41,13 @@ while true; do
   attempt=$((attempt + 1))
   ckpt="$INIT"
   off="$TB_OFFSET"
-  if (( attempt > 1 )); then
-    newest="$(ls -t "$DIR"/checkpoints/*.flax_model 2>/dev/null | head -1)"
-    [[ -n "$newest" ]] && ckpt="$newest"
-    last="$(grep -o 'global_step=[0-9]*' "$LOG" 2>/dev/null | tail -1 | cut -d= -f2)"
+  newest="$(ls -t "$DIR"/checkpoints/*.flax_model 2>/dev/null | head -1)"
+  if [[ -n "$newest" ]]; then
+    ckpt="$newest"
+    last="$(grep -a -o 'global_step=[0-9]*' "$LOG" 2>/dev/null | tail -1 | cut -d= -f2)"
     [[ -n "$last" ]] && off="$last"
   fi
-  crash_file="$DIR/crash_attempt$attempt.txt"
+  crash_file="$DIR/crash_$(date +%Y%m%d_%H%M%S).txt"
   wlog "attempt $attempt: start from $ckpt (tb_offset $off)"
   YGO_CRASH_FILE="$crash_file" python -u cleanba.py "${ARGS[@]}" \
     --checkpoint "$ckpt" --tb_offset "$off" >> "$LOG" 2>&1
