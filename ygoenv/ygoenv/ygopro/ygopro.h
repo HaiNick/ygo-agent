@@ -3063,7 +3063,10 @@ private:
     } else if (effect >= CARD_EFFECT_OFFSET) {
       effect = effect - CARD_EFFECT_OFFSET + 2;
     } else {
-      effect = system_string_to_id(effect);
+      // A system string outside the table (for example 60/61, heads/tails)
+      // used to throw and abort the process. Encode it as "no description".
+      auto it = system_string2id.find(effect);
+      effect = it != system_string2id.end() ? it->second : 0;
     }
     feat(i, 6) = static_cast<uint8_t>(effect);
   }
@@ -4703,6 +4706,17 @@ private:
         winner->notify("You won (" + l_reason + ").");
         loser->notify("You lost (" + l_reason + ").");
       }
+    } else if (msg_ == MSG_TOSS_COIN || msg_ == MSG_TOSS_DICE ||
+               msg_ == MSG_CONFIRM_EXTRATOP || msg_ == MSG_SWAP_GRAVE_DECK ||
+               msg_ == MSG_REVERSE_DECK || msg_ == MSG_DECK_TOP ||
+               msg_ == MSG_FIELD_DISABLED || msg_ == MSG_CANCEL_TARGET ||
+               msg_ == MSG_HAND_RES || msg_ == MSG_MATCH_KILL ||
+               msg_ == MSG_SHOW_HINT || msg_ == MSG_AI_NAME ||
+               msg_ == MSG_CUSTOM_MSG) {
+      // Display-only messages that need no answer. They used to fall through
+      // to "Unknown message" and abort the process; skip them like the other
+      // display-only messages above.
+      dp_ = dl_;
     } else if (msg_ == MSG_RETRY) {
       throw std::runtime_error("Retry");
     } else if (msg_ == MSG_SELECT_BATTLECMD) {
