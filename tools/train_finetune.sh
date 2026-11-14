@@ -2,8 +2,9 @@
 # Start fine-tuning with scripts/cleanba.py in a detached tmux session, under
 # the crash watchdog (tools/train_watchdog.sh).
 #
-# README single-GPU settings (16 envs x 2 actor threads, 8 minibatches, lr 1e-4,
-# vloss_clip 1.0, eval vs the built-in bot every 50 iters), plus:
+# README single-GPU settings (8 minibatches, lr 1e-4, vloss_clip 1.0, eval vs
+# the built-in bot every 50 iters) with 64 envs x 2 actor threads x 32 steps
+# (env: NUM_ENVS, ACTOR_THREADS, NUM_STEPS, STEP_TIMEOUT; see below), plus:
 #   --checkpoint INIT, --num_embeddings 15017, --freeze_id True (embeddings frozen
 #   as in the original training), --deck DECK_DIR, --save_interval SAVE_INTERVAL,
 #   --n_saved 0 (keep every checkpoint), TensorBoard logs on.
@@ -38,6 +39,17 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
 TB_OFFSET="${TB_OFFSET:-0}"
 XLA_MEM_FRACTION="${XLA_MEM_FRACTION:-}"
 EXTRA="${EXTRA:-}"
+# Actor layout. envs x threads x steps = samples per update (64 x 2 x 32 = 4096,
+# the same as the old 16 x 2 x 128). The model call costs the same for 64 envs
+# as for 16, so this layout measured +58% SPS (docs/AUDIT.md, P1). NUM_STEPS is
+# also the LSTM backpropagation length: NUM_ENVS=16 NUM_STEPS=128 gives the
+# layout of the runs up to ft_0546_pool52_r4.
+NUM_ENVS="${NUM_ENVS:-64}"
+ACTOR_THREADS="${ACTOR_THREADS:-2}"
+NUM_STEPS="${NUM_STEPS:-32}"
+# Env step timeout in seconds. 0 steps on the envpool worker thread (a little
+# faster) but a duel that never returns then hangs training for good.
+STEP_TIMEOUT="${STEP_TIMEOUT:-600}"
 DIR="$HOME/ygo/runs/$RUN"
 
 if tmux has-session -t "$RUN" 2>/dev/null; then
@@ -51,7 +63,9 @@ mkdir -p "$DIR/checkpoints" "$DIR/tb"
 ARGS=(
   --actor-device-ids 0 --learner-device-ids 0
   --deck "$DECK_DIR"
-  --local-num_envs 16 --num-minibatches 8 --learning-rate 1e-4 --vloss_clip 1.0
+  --local-num_envs "$NUM_ENVS" --num_actor_threads "$ACTOR_THREADS" --num_steps "$NUM_STEPS"
+  --timeout "$STEP_TIMEOUT"
+  --num-minibatches 8 --learning-rate 1e-4 --vloss_clip 1.0
   --save_interval "$SAVE_INTERVAL" --local_eval_episodes 32 --eval_interval 50 --seed "$SEED"
   --num_embeddings "$NEMB" --freeze_id True
   --ckpt_dir "$DIR/checkpoints" --n_saved 0 --tb_dir "$DIR/tb")
