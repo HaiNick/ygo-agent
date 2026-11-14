@@ -10,6 +10,7 @@ import flax
 from ygoai.rl.jax.agent import RNNAgent
 
 def create_agent():
+    num_embeddings = int(os.environ.get("NUM_EMBEDDINGS", 15017))
     return RNNAgent(
         num_layers=2,
         rnn_channels=512,
@@ -19,6 +20,7 @@ def create_agent():
         film=True,
         noam=True,
         version=2,
+        embedding_shape=num_embeddings,
     )
 
 

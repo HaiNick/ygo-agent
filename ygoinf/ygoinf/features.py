@@ -81,23 +81,26 @@ system_strings = [
     220,  221,  222,  221,  1621, 1622,
 ]
 
+# The env keeps these strings in a std::map, so its ids follow the sorted keys
+# (1 -> 16, 30 -> 17, ..., 221 -> 36, 1050 -> 38), not the order written above.
+# The model was trained with the env's ids.
 system_string_to_id = {
-    s: i + 16 for i, s in enumerate(system_strings)
+    s: i + 16 for i, s in enumerate(sorted(set(system_strings)))
 }
 
 code_to_id = {}
 
 def init_code_list(code_list_file):
-    i = 1
+    # Same numbering as the env (init_module in ygopro.h): the id is the line
+    # number, lines are "code [has_script]", unparseable lines keep their number.
     if len(code_to_id) == 0:
         code_to_id[0] = 0
         with open(code_list_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if len(line) == 0:
+            for i, line in enumerate(f, start=1):
+                parts = line.split()
+                if len(parts) == 0 or not parts[0].isdigit():
                     continue
-                code_to_id[int(line)] = i
-                i += 1
+                code_to_id[int(parts[0])] = i
 
 
 def get_code_id(code):
@@ -462,7 +465,11 @@ def float_transform(x):
 def encode_card(card: Card):
     x = np.zeros(N_CARD_FEATURES, dtype=np.uint8)
 
-    x[0:2] = int_transform(get_code_id(card.code))
+    # Columns 0-1 (card id) stay 0: the env never writes the card id into the
+    # card list (ygopro.h _set_obs_cards calls _set_obs_card_ without it), so
+    # the model was trained with id 0 for every card here. Card identity
+    # reaches the model through the action and history ids only.
+    get_code_id(card.code)  # still reject unknown codes
 
     x[2] = location_to_id[card.location]
     if card.location in [Location.mzone, Location.szone, Location.grave]:
@@ -482,7 +489,9 @@ def encode_card(card: Card):
     x[7] = attribute_to_id[card.attribute]
     x[8] = race_to_id[card.race]
     x[9] = min(max(card.level, 0), 13)
-    x[10] = min(max(card.counter, 0), 15)
+    # The env stores the raw counter word (type | count << 16) clamped to 15,
+    # so training only ever saw 0 (no counters) or 15.
+    x[10] = 15 if card.counter > 0 else 0
     x[11] = negated_to_id[card.negated]
 
     x[12:14] = float_transform(card.attack)
@@ -1074,7 +1083,9 @@ class PredictState:
     def update_history_actions(self, idx: int):
         idx1 = transform_select_idx(self._probs, idx, self._action_msg)
         action = self._actions[idx1]
-        self.history_actions.update(action, self._turn, self._phase)
+        # the env does not record cancels (update_history_actions in ygopro.h)
+        if action[4] != action_act_to_id[ActionAct.cancel]:
+            self.history_actions.update(action, self._turn, self._phase)
         self.reset()
 
     def record(self, input: Input, actions, probs):
