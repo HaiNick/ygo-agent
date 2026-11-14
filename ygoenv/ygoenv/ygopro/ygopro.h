@@ -2192,9 +2192,10 @@ public:
         uint16_t name[20];
         memset(name, 0, 40);
         std::string name_str = fmt::format("{} {}", nickname_[i], deck_name_[i]);
-        if (name_str.size() > 20) {
-          // truncate
-          name_str = name_str.substr(0, 20);
+        // The name field is 20 UTF-16 units including the terminator. Readers
+        // look for the NUL inside the field, so keep at most 19 characters.
+        if (name_str.size() > 19) {
+          name_str = name_str.substr(0, 19);
         }
         fmt::println("name: {}", name_str);
         str_to_uint16(name_str.c_str(), name);
@@ -3131,12 +3132,13 @@ private:
 
 
   void str_to_uint16(const char* src, uint16_t* dest) {
-      for (int i = 0; i < strlen(src); i += 1) {
-        dest[i] = src[i];
+      // dest is a zero-filled uint16_t[20] and src has at most 19 characters,
+      // so the terminator is already there. (The old code wrote the terminator
+      // at strlen + 1, past the buffer for names of 19 or 20 characters.)
+      const size_t n = std::min<size_t>(strlen(src), 19);
+      for (size_t i = 0; i < n; i += 1) {
+        dest[i] = static_cast<uint8_t>(src[i]);
       }
-
-      // Add null terminator
-      dest[strlen(src) + 1] = '\0';
   }
 
   void ReplayWriteData(const void *data, size_t len) {
