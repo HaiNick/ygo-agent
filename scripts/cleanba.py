@@ -52,6 +52,8 @@ class Args:
     """the path to the model checkpoint to load"""
     timeout: int = 600
     """the timeout of the environment step"""
+    malloc_trim_interval: float = 10.0
+    """seconds between malloc_trim(0) calls that return free heap pages to the OS (0 disables)"""
     debug: bool = False
     """whether to run the script in debug mode"""
 
@@ -196,6 +198,29 @@ class Args:
     freeze_id: Optional[bool] = None
     deck_names: Optional[List[str]] = None
     real_seed: Optional[int] = None
+
+
+def start_malloc_trim(interval):
+    # glibc keeps memory freed by the env threads (duels, Lua states) in its
+    # per-thread arenas and only returns the top of each heap to the OS. With
+    # 64 envs x 2 actor threads the free part grew by 2-3 GB per hour and the
+    # trainer was OOM-killed. malloc_trim(0) releases the free pages of all
+    # arenas. It only changes RSS, not what the program computes.
+    if interval <= 0:
+        return
+    try:
+        import ctypes
+        malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        print("malloc_trim is not available (not glibc), --malloc_trim_interval ignored")
+        return
+
+    def loop():
+        while True:
+            time.sleep(interval)
+            malloc_trim(0)  # ctypes releases the GIL during the call
+
+    threading.Thread(target=loop, name="malloc_trim", daemon=True).start()
 
 
 def make_env(args, seed, num_envs, num_threads, mode='self', thread_affinity_offset=-1, eval=False):
@@ -659,6 +684,7 @@ def main():
         assert args.num_steps % args.segment_length == 0, "num_steps must be divisible by segment_length"
     args.collect_steps = args.collect_steps or args.num_steps
     assert args.collect_steps >= args.num_steps, "collect_steps must be greater than or equal to num_steps"
+    start_malloc_trim(args.malloc_trim_interval)
 
     if args.embedding_file:
         embeddings = load_embeddings(args.embedding_file, args.code_list_file)
