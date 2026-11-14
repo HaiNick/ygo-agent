@@ -601,3 +601,49 @@ rebuild found in Step 0 means the reference can be regenerated from any commit.
 Not in the top 10 because they change what the model sees or does and need a decision first: C9
 (revealed cards), C10 (action truncation order), C11 (counters), and passing real card IDs in the
 env (K1, larger option).
+
+## Phase 2 results (2026-11-14, branch `audit-fixes`)
+
+All ten plan items were approved. One commit per item, each with its test or measurement in the
+commit message. `KNOWN_ISSUES.md` lists what's fixed and what's open.
+
+| Plan item | Commit subject | Result |
+|---|---|---|
+| 1 (C1) | ygopro env: clamp the card level feature to 13 | Non-finite decisions in 512,000: 11 → 0 |
+| 2 (C2) | cleanba: make non-finite losses visible, never save NaN checkpoints | Warning, counter, exit code 3 instead of a NaN save. `--debug` stop no longer hangs |
+| 3 | Add tools/run_checks.sh | Quick and full mode |
+| 4 (C3) | Replays: terminate player names, fix write past the name buffer | Names terminated for all decks, replays pass `yrp_verify` |
+| 5 (C4, C6, C7, C8) | ygopro env: bounds and error-propagation fixes | Digests identical |
+| 6 (P1) | train_finetune: 64 envs x 2 threads x 32 steps | See the SPS table below |
+| 7 (K1 to K4) | ygoinf: encode observations like the training env | 9 of 9 encoding checks pass (2 failed before) |
+| 8 (P2, P3) | don't copy card text; optional inline stepping | Digests identical. Env-only +0% to +10% and up to +30% single-threaded |
+| 9 (O1, O2) | battle.py: fix --record; Remove the legacy ygopro0 env | 1 episode → 1 replay, 4 → 4 |
+| 10 (C5, O3) | don't abort on display-only messages; deck lint; prune_checkpoints.sh | Coin and dice test deck: abort → 172 games |
+
+Training SPS, `cleanba.py --debug`, 200 s, same checkpoint and pool:
+
+| Layout | Build `15c7726` | Build `audit-fixes` |
+|---|---|---|
+| 16 × 2 × 128 (old default) | 2,690 | 2,850 (+6%) |
+| 64 × 2 × 32 (new default), `--timeout 600` | 4,260 | 4,590 (+71% over the old default on the old build) |
+| 64 × 2 × 32, `--timeout 0` | | 4,598 (no gain in training, so the default stays 600) |
+
+Corrections to Phase 1 estimates:
+
+- P2 (card text copies) gave about 4% on average, not the estimated 10% to 20%.
+- P3 (inline stepping) gives 20% to 30% for a single env thread, 5% at 64 envs on 12 threads, and
+  nothing in training, where the CPU is already saturated.
+
+Deliberately not done:
+
+- C12 (processing messages that follow a skipped one) changes observations and needs a verified
+  length for every message. Only the abort on unknown display-only messages was removed.
+- ygoinf support for card-name declarations and a state-level differential test (step 9 of the test
+  plan). `tools/test_ygoinf_encoding.py` covers the encoding tables and unit behavior.
+- C9, C10, C11, and real card ids in the card list (K1, larger option): these change what the model
+  sees and stay open for a decision.
+
+How the determinism gate was run: the baseline build is `15c7726`. Its digests are compared with the
+level column clamped to 13 (`dump_trajectory.py --clamp-level 13`), because item 1 changes exactly
+that column on purpose. With the clamp applied, every commit on this branch produces the same
+digests as the baseline for `decks/mine` and `decks/train`.
