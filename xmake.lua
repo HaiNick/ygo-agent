@@ -9,6 +9,13 @@ add_requires(
     "sqlite3 3.43.0+200", "concurrentqueue 1.0.4", "unordered_dense 4.4.*",
     "sqlitecpp 3.2.1", "xz 5.8.1")
 
+option("replay_format")
+    set_default("yrp2")
+    set_showmenu(true)
+    set_values("yrp2", "yrp2_nolzma", "yrp1")
+    set_description("Replay format of ygopro_ygoenv (--record). yrp1 also creates duels with the single-seed create_duel.")
+option_end()
+
 
 target("core_lua_probe")
     -- test helper: run a Lua file in a core duel (tools/check_category_sset.py)
@@ -42,6 +49,11 @@ target("ygopro_ygoenv")
     add_rules("python.library")
     add_files("ygoenv/ygoenv/ygopro/*.cpp")
     add_packages("pybind11", "fmt", "glog", "concurrentqueue", "sqlitecpp", "unordered_dense", "ygopro-core", "xz")
+    if is_config("replay_format", "yrp1") then
+        add_defines("YGO_REPLAY_YRP1")
+    elseif is_config("replay_format", "yrp2_nolzma") then
+        add_defines("YGO_REPLAY_NOLZMA")
+    end
     set_languages("c++17")
     if is_mode("release") then
         set_policy("build.optimization.lto", true)

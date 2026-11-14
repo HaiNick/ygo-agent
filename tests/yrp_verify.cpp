@@ -193,6 +193,8 @@ static std::string open_replay(const char *path, Replay &r) {
     r.data.resize(MAX_REPLAY_SIZE);
     r.data.resize(std::fread(r.data.data(), 1, MAX_REPLAY_SIZE, fp));
     std::fclose(fp);
+    // Plain body: datasize is 0 (yrp1 as this env writes it) or the body size.
+    if (b.datasize && b.datasize != r.data.size()) return "datasize does not match the plain body";
   }
   // ReadInfo (two players, no tag, no single mode)
   if (b.flag & (REPLAY_TAG | REPLAY_SINGLE_MODE)) return "tag/single mode not supported by this verifier";
@@ -364,8 +366,10 @@ static bool verify(const char *path) {
   const auto &b = r.h.base;
   std::printf("%s\n", path);
   if (!err.empty()) { std::printf("  FAIL: %s\n", err.c_str()); return false; }
-  std::printf("  id=%s version=0x%x flag=0x%x datasize=%u decks %zu/%zu vs %zu/%zu\n",
-              b.id == REPLAY_ID_YRP2 ? "yrp2" : "yrp1", b.version, b.flag, b.datasize,
+  std::printf("  id=%s seeding=%s body=%s version=0x%x flag=0x%x datasize=%u decks %zu/%zu vs %zu/%zu\n",
+              b.id == REPLAY_ID_YRP2 ? "yrp2" : "yrp1",
+              b.id == REPLAY_ID_YRP2 ? "create_duel_v2(8 seeds)" : "create_duel(mt19937(seed)())",
+              (b.flag & REPLAY_COMPRESSED) ? "lzma" : "plain", b.version, b.flag, b.datasize,
               r.main[0].size(), r.extra[0].size(), r.main[1].size(), r.extra[1].size());
   intptr_t pduel;
   if (b.id == REPLAY_ID_YRP1) {

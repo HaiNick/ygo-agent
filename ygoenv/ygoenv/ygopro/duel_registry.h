@@ -19,6 +19,11 @@ inline intptr_t create_duel(uint32_t (&seed_sequence)[SEED_COUNT]) {
   return create_duel_v2(seed_sequence);
 }
 
+inline intptr_t create_duel_single_seed(uint_fast32_t seed) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return ::create_duel(seed);
+}
+
 inline void end_duel(intptr_t pduel) {
   std::lock_guard<std::mutex> lock(g_mutex);
   ::end_duel(pduel);

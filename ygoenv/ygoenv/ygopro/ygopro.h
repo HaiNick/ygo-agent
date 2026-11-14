@@ -984,6 +984,18 @@ inline std::string time_now() {
 // PRO_VERSION of the reference client (Fluorohydride/ygopro gframe/config.h)
 constexpr uint32_t YGOPRO_REPLAY_VERSION = 0x1362;
 
+// Replay format, chosen at build time with xmake f --replay_format=...
+//   yrp2 (default)  yrp2 header with 8 seeds, LZMA body, create_duel_v2
+//   yrp2_nolzma     same as yrp2, body not compressed
+//   yrp1            yrp1 header with one seed, body not compressed, duels
+//                   created with the core's single-seed create_duel; header
+//                   fields as written before the core bump (version 0x1360,
+//                   datasize 0)
+#if defined(YGO_REPLAY_YRP1) && defined(YGO_REPLAY_NOLZMA)
+#error "YGO_REPLAY_YRP1 and YGO_REPLAY_NOLZMA are exclusive"
+#endif
+constexpr uint32_t YRP1_REPLAY_VERSION = 0x1360;
+
 // max size
 #define MAX_REPLAY_SIZE	0x80000
 
@@ -1603,6 +1615,12 @@ static void init_module(const std::string &db_path,
     }
   }
   ygo_crash::install_from_env();
+#ifdef YGO_REPLAY_YRP1
+  // This build creates duels with the core's single-seed create_duel, so the
+  // same env seed gives different games than the default (yrp2) build.
+  fmt::print(stderr, "[init_module] built with --replay_format=yrp1: single-seed duels, "
+                     "games differ from the default build; use it for recording only\n");
+#endif
 
   // parse code from code_list_file
   SQLite::Database db(db_path, SQLite::OPEN_READONLY);
@@ -2211,8 +2229,13 @@ public:
 
       replay_header_ = ExtendedReplayHeader();
       auto &rh = replay_header_.base;
+#ifdef YGO_REPLAY_YRP1
+      rh.id = REPLAY_ID_YRP1;
+      rh.version = YRP1_REPLAY_VERSION;
+#else
       rh.id = REPLAY_ID_YRP2;
       rh.version = YGOPRO_REPLAY_VERSION;
+#endif
       rh.flag = REPLAY_UNIFORM;
       rh.seed = static_cast<uint32_t>(duel_seed);
       rh.start_time = (unsigned int)time(nullptr);
@@ -3209,6 +3232,17 @@ private:
       return;
     }
     ExtendedReplayHeader h = replay_header_;
+#if defined(YGO_REPLAY_YRP1)
+    // 32-byte header, then the plain body (datasize stays 0, as the old writer)
+    const size_t header_size = sizeof(ReplayHeader);
+    const uint8_t *body = replay_data_.data();
+    size_t body_size = replay_data_.size();
+#elif defined(YGO_REPLAY_NOLZMA)
+    h.base.datasize = static_cast<uint32_t>(replay_data_.size());
+    const size_t header_size = sizeof(ExtendedReplayHeader);
+    const uint8_t *body = replay_data_.data();
+    size_t body_size = replay_data_.size();
+#else
     h.base.datasize = static_cast<uint32_t>(replay_data_.size());
     h.base.flag |= REPLAY_COMPRESSED;
     lzma_options_lzma opt;
@@ -3236,6 +3270,10 @@ private:
       fmt::println("[replay] LZMA encode failed ({}), replay not saved", static_cast<int>(lret));
       return;
     }
+    const size_t header_size = sizeof(ExtendedReplayHeader);
+    const uint8_t *body = comp.data();
+    size_t body_size = out_pos;
+#endif
     std::string fname;
     auto id4 = replay_id4_;
     while (true) {
@@ -3250,8 +3288,8 @@ private:
     if (!fp) {
       throw std::runtime_error("Failed to open file for replay: " + tmp);
     }
-    fwrite(&h, sizeof(h), 1, fp);
-    fwrite(comp.data(), out_pos, 1, fp);
+    fwrite(&h, header_size, 1, fp);
+    fwrite(body, body_size, 1, fp);
     fclose(fp);
     std::filesystem::rename(tmp, fname);
   }
@@ -3261,10 +3299,17 @@ private:
     // create_duel_v2 (the reference server's RNG) through the registry lock:
     // the core's duel registry is a global std::set shared by all env threads.
     std::mt19937 rnd(seed);
+#ifdef YGO_REPLAY_YRP1
+    // Single-seed duel, the way a player re-creates a yrp1 replay:
+    // mt19937 rnd(header.seed); create_duel(rnd())
+    std::fill(std::begin(seed_sequence), std::end(seed_sequence), 0u);
+    return ygo_registry::create_duel_single_seed(rnd());
+#else
     for (auto &s : seed_sequence) {
       s = rnd();
     }
     return ygo_registry::create_duel(seed_sequence);
+#endif
   }
 
   void YGO_SetPlayerInfo(intptr_t pduel, int32 playerid, int32 lp, int32 startcount, int32 drawcount) const {
