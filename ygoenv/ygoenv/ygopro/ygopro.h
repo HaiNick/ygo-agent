@@ -5885,14 +5885,19 @@ public:
 
   void Reset() override {
     int idx = env_impls_.size() - 1;
-    auto& pool = get_pool(idx);
-    auto fut = pool.submit_task([this, idx]() {
+    if (timeout_ <= 0) {
+      // timeout=0: no watchdog, run on the calling worker thread (see Step)
       env_impls_[idx].reset();
-    });
-    if (fut.wait_for(std::chrono::seconds(timeout_)) != std::future_status::ready) {
-      throw std::runtime_error("Reset timeout");
+    } else {
+      auto& pool = get_pool(idx);
+      auto fut = pool.submit_task([this, idx]() {
+        env_impls_[idx].reset();
+      });
+      if (fut.wait_for(std::chrono::seconds(timeout_)) != std::future_status::ready) {
+        throw std::runtime_error("Reset timeout");
+      }
+      fut.get();  // rethrow an exception from reset() instead of discarding it
     }
-    fut.get();  // rethrow an exception from reset() instead of discarding it
 
     auto &env_impl = env_impls_[idx];
     elapsed_step_ = 0;
@@ -5905,6 +5910,18 @@ public:
     int idx = env_impls_.size() - 1;
     auto& pool = get_pool(idx);
     int action_idx = action["action"_];
+    if (timeout_ <= 0) {
+      // timeout=0: step on the calling envpool worker thread. This skips the
+      // handoff to the per-env thread and back (about 20% of a step), at the
+      // price of no protection against a duel that never returns. With the
+      // default timeout the path below is unchanged.
+      auto& env_impl = env_impls_[idx];
+      env_impl.step(action_idx);
+      done_ = env_impl.ret_reward_ != 0;
+      State state = Allocate();
+      env_impl.WriteState(state);
+      return;
+    }
     pool.detach_task([this, action_idx, idx]() {
       // Test timeout: random sleep with probability 0.01
       // if (dist_int_(gen_) % 10000 == 0) {
