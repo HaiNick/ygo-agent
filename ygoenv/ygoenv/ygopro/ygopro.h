@@ -1148,6 +1148,33 @@ public:
 
   ~Card() = default;
 
+  // Copy without the text fields (name, description, effect strings). The
+  // observation code only reads the numeric fields; copying about 18 strings
+  // for every card of every observation was the largest cost outside the core.
+  Card light_copy() const {
+    Card c;
+    c.code_ = code_;
+    c.alias_ = alias_;
+    c.setcode_ = setcode_;
+    c.type_ = type_;
+    c.level_ = level_;
+    c.lscale_ = lscale_;
+    c.rscale_ = rscale_;
+    c.attack_ = attack_;
+    c.defense_ = defense_;
+    c.race_ = race_;
+    c.attribute_ = attribute_;
+    c.link_marker_ = link_marker_;
+    c.data_ = data_;
+    c.status_ = status_;
+    c.controler_ = controler_;
+    c.location_ = location_;
+    c.sequence_ = sequence_;
+    c.position_ = position_;
+    c.counter_ = counter_;
+    return c;
+  }
+
   void set_location(uint32_t location) {
     controler_ = location & 0xff;
     location_ = (location >> 8) & 0xff;
@@ -3464,7 +3491,8 @@ private:
     }
     f = q_read_u32();
     CardCode code = q_read_u32();
-    Card c = c_get_card(code);
+    // names are only printed in verbose mode
+    Card c = verbose_ ? c_get_card(code) : c_get_card(code).light_copy();
     uint32_t position = q_read_u32();
     c.set_location(position);
     uint32_t level = q_read_u32();
@@ -3513,7 +3541,7 @@ private:
       }
       f = q_read_u32();
       CardCode code = q_read_u32();
-      Card c = c_get_card(code);
+      Card c = c_get_card(code).light_copy();  // observation only, no text
 
       uint8_t controller = q_read_u8();
       uint8_t location = q_read_u8();
@@ -3543,7 +3571,7 @@ private:
       uint32_t n_xyz = q_read_u32();
       for (int i = 0; i < n_xyz; ++i) {
         auto code = q_read_u32();
-        Card c_ = c_get_card(code);
+        Card c_ = c_get_card(code).light_copy();
         c_.controler_ = controller;
         c_.location_ = location | LOCATION_OVERLAY;
         c_.sequence_ = sequence;
