@@ -101,9 +101,13 @@ if __name__ == "__main__":
     args = tyro.cli(Args)
 
     if args.record:
+        # The replay writer needs one env. "accurate" would set num_envs back
+        # to num_episodes, so record mode plays the episodes one after another
+        # and alternates the seats per game instead.
         args.num_envs = 1
         args.verbose = True
-        print("Set num_envs=1 and verbose=True for recording")
+        args.accurate = False
+        print("Set num_envs=1, verbose=True and accurate=False for recording")
         if not os.path.exists("replay"):
             os.makedirs("replay")
 
@@ -186,7 +190,9 @@ if __name__ == "__main__":
         next_rstate, logits = agent.apply(params, obs, rstate)[:2]
         probs = jax.nn.softmax(logits, axis=-1)
         if done is not None:
-            next_rstate = jnp.where(done[:, None], 0, next_rstate)
+            # the LSTM state is a tuple (h, c)
+            next_rstate = jax.tree.map(
+                lambda x: jnp.where(done[:, None], 0, x), next_rstate)
         return next_rstate, probs
 
     if num_envs != 1:
@@ -212,6 +218,10 @@ if __name__ == "__main__":
                 rstate1, probs = get_probs(params1, rstate1, obs, done, 1)
             else:
                 rstate2, probs = get_probs(params2, rstate2, obs, done, 2)
+            if done[0]:
+                # new game: reset both agents, not only the one that moved
+                rstate1 = agent1.init_rnn_state(1)
+                rstate2 = agent2.init_rnn_state(1)
             return rstate1, rstate2, np.array(probs)
 
     obs, infos = envs.reset()
@@ -236,6 +246,10 @@ if __name__ == "__main__":
         main_player = np.concatenate([second_player, first_player])
     else:
         main_player = np.concatenate([first_player, second_player])
+    if num_envs == 1:
+        # one env: checkpoint1 moves first in game 1 (second with --reverse),
+        # then the seats alternate every game
+        main_player = np.array([1 if args.reverse else 0], dtype=np.int64)
     rstate1 = agent1.init_rnn_state(num_envs)
     rstate2 = agent2.init_rnn_state(num_envs)
     collected = np.zeros((args.num_episodes,), dtype=np.bool_)
@@ -295,11 +309,9 @@ if __name__ == "__main__":
                 pbar.set_postfix(len=np.mean(episode_lengths), reward=np.mean(episode_rewards), win_rate=np.mean(win_rates))
                 pbar.update(1)
 
-            # Only when num_envs=1, we switch the player here
-            if args.verbose:
-                main_player = 1 - main_player
-            else:
-                main_player[idx] = 1 - main_player[idx]
+            # switch the seats of this env for its next game (flipping every
+            # env here, as before in verbose mode, changed seats mid-game)
+            main_player[idx] = 1 - main_player[idx]
 
         if len(episode_lengths) >= int(args.num_episodes * (1 - args.truncate)):
             break
