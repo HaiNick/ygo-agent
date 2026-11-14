@@ -697,6 +697,7 @@ def main():
 
     dummy_writer = SimpleNamespace()
     dummy_writer.add_scalar = lambda x, y, z: None
+    dummy_writer.close = lambda: None  # a clean stop calls writer.close()
 
     if args.local_rank == 0 and not args.debug and args.tb_dir is not None:
         from tensorboardX import SummaryWriter
@@ -1132,6 +1133,18 @@ def main():
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
+    nonfinite_updates = 0
+
+    def save_checkpoint(params, name):
+        # Never write a checkpoint with NaN/Inf parameters: the watchdog resumes
+        # from the newest file. Exit code 3 makes it resume from the last good one.
+        if not all(bool(jnp.isfinite(x).all()) for x in jax.tree.leaves(params)):
+            print(f"ERROR: parameters are non-finite at iteration {learner_policy_version}; "
+                  f"checkpoint {name} not saved, exiting", flush=True)
+            writer.close()
+            os._exit(3)
+        ckpt_maneger.save(params, name)
+
     while True:
         learner_policy_version += 1
         rollout_queue_get_time_start = time.time()
@@ -1180,6 +1193,15 @@ def main():
         loss = loss[-1].item()
         if np.isnan(loss) or np.isinf(loss):
             raise ValueError(f"loss is {loss}")
+        # get_loss replaces a non-finite loss with 0, so the check above cannot see it.
+        # The loss terms stay non-finite: such a minibatch update was dropped by
+        # apply_if_finite (and would be applied after 10 in a row).
+        if not all(np.isfinite(np.asarray(x)).all() for x in (pg_loss, v_loss, ent_loss, approx_kl)):
+            nonfinite_updates += 1
+            print(
+                f"WARNING: non-finite loss terms in iteration {learner_policy_version} "
+                f"({nonfinite_updates} iterations so far); the affected minibatch updates were dropped",
+                flush=True)
 
         # record rewards for plotting purposes
         if learner_policy_version % args.log_frequency == 0:
@@ -1206,19 +1228,20 @@ def main():
             writer.add_scalar("losses/entropy", ent_loss[-1].item(), tb_global_step)
             writer.add_scalar("losses/approx_kl", approx_kl[-1].item(), tb_global_step)
             writer.add_scalar("losses/loss", loss, tb_global_step)
+            writer.add_scalar("stats/nonfinite_updates", nonfinite_updates, tb_global_step)
 
         saved_now = False
         if args.local_rank == 0 and learner_policy_version % args.save_interval == 0 and not args.debug:
             ckpt_steps = tb_global_step // 2**20
             step_str = "M"
             ckpt_name = f"{timestamp}_{ckpt_steps}{step_str}.flax_model"
-            ckpt_maneger.save(unreplicated_params, ckpt_name)
+            save_checkpoint(unreplicated_params, ckpt_name)
             saved_now = True
 
         if stop_requested.is_set() or os.path.exists(stop_file):
             if args.local_rank == 0 and not args.debug and not saved_now:
                 ckpt_name = f"{timestamp}_{tb_global_step // 2**20}M_iter{learner_policy_version}.flax_model"
-                ckpt_maneger.save(unreplicated_params, ckpt_name)
+                save_checkpoint(unreplicated_params, ckpt_name)
             print(f"stop requested: saved checkpoint at iteration {learner_policy_version}, exiting", flush=True)
             writer.close()
             # actor threads are not daemons and run until num_updates; end the process
