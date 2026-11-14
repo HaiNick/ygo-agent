@@ -21,6 +21,14 @@ details, measurements, and line numbers.
 
 Run everything with `tools/run_checks.sh quick` or `tools/run_checks.sh full`.
 
+## Notes
+
+- The current best model is described in `docs/model_ft_r4_100M.md`.
+- Replay format: the default build writes yrp2 with LZMA, which MDPro4 plays. `xmake f
+  --replay_format=yrp2_nolzma` or `--replay_format=yrp1` builds the other formats. A `yrp1` build
+  creates duels with the single-seed RNG, so the same seed gives different games. Use it for
+  recording only.
+
 ## Open
 
 ### Needs a decision because it changes what the model sees or does
@@ -53,8 +61,9 @@ Run everything with `tools/run_checks.sh quick` or `tools/run_checks.sh full`.
   Academic Arcane Arts Acropolis, and The Black Goat Laughs use them.
 - No test replays the same game state through the env's encoder and ygoinf's. The position of
   hidden cards depends on what the client sends.
-- The local-play scripts (`tools/start_local_play.sh` and friends) are untracked files in the main
-  checkout.
+- `tools/start_local_play.sh` starts ygoinf, a local `ygopro-server`, a WebSocket proxy, and Neos. It
+  overwrites `~/ygo/ygoinf.log` and the logs in `~/ygo/local_server`, and adds a `Local_Offline`
+  host entry to MDPro4's `hosts2.conf` if that file has no local entry.
 
 ### Smaller items
 
