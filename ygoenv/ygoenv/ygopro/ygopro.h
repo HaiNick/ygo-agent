@@ -1946,11 +1946,13 @@ protected:
   PlayerId to_play_;
   std::function<void(int)> callback_;
 
-  byte data_[4096];
+  byte data_[SIZE_MESSAGE_BUFFER];  // the core's own limit (was 4096)
   int dp_ = 0;
   int dl_ = 0;
 
-  byte query_buf_[4096];
+  // query_field_card has no size limit: about 60 bytes per card plus overlay
+  // and counter lists. 4096 overflowed at 69 cards in one location.
+  byte query_buf_[0x4000];
   int qdp_ = 0;
 
   byte resp_buf_[SIZE_RETURN_VALUE] = {};
@@ -2480,6 +2482,11 @@ public:
 
   void step(int idx) {
     ygo_crash::mark_thread(crash_slot_);
+    if (idx < 0 || idx >= static_cast<int>(legal_actions_.size())) {
+      throw std::runtime_error(fmt::format(
+          "[step] action {} is out of range: {} legal actions ({})",
+          idx, legal_actions_.size(), msg_to_string(msg_)));
+    }
     callback_(idx);
     update_history_actions(to_play_, legal_actions_[idx]);
 
@@ -2699,6 +2706,7 @@ private:
   using SpecInfos = ankerl::unordered_dense::map<std::string, SpecInfo>;
 
   std::tuple<SpecInfos, std::vector<int>> _set_obs_cards(TArray<uint8_t> &f_cards, PlayerId to_play) {
+    const int max_rows = max_cards() * 2;
     SpecInfos spec_infos;
     std::vector<int> loc_n_cards;
     int offset = 0;
@@ -2720,6 +2728,7 @@ private:
           auto n_cards = YGO_QueryFieldCount(pduel_, player, location);
           loc_n_cards.push_back(n_cards);
           for (auto i = 0; i < n_cards; i++) {
+            if (offset >= max_rows) break;  // no row left (see below)
             f_cards(offset, 2) = location_to_id(location);
             f_cards(offset, 4) = 1;
             offset++;
@@ -2742,6 +2751,10 @@ private:
             if (!hide) {
               card_id = c_get_card_id(c.code_);
             }
+            // The observation has max_cards * 2 rows. Two 60-card decks plus
+            // tokens can exceed that; writing on would run into the next
+            // env's slice of the batch.
+            if (offset >= max_rows) break;
             _set_obs_card_(f_cards, offset, c, hide);
             offset++;
 
@@ -3483,6 +3496,10 @@ private:
                     QUERY_OVERLAY_CARD | QUERY_COUNTERS | QUERY_STATUS |
                     QUERY_LSCALE | QUERY_RSCALE | QUERY_LINK;
     int32_t bl = YGO_QueryFieldCard(pduel_, player, loc, flags, query_buf_);
+    if (bl > static_cast<int32_t>(sizeof(query_buf_))) {
+      throw std::runtime_error(fmt::format(
+          "[get_cards_in_location] query of {} bytes overflowed the {} byte buffer", bl, sizeof(query_buf_)));
+    }
     qdp_ = 0;
     std::vector<Card> cards;
     while (true) {
@@ -5847,6 +5864,7 @@ public:
     if (fut.wait_for(std::chrono::seconds(timeout_)) != std::future_status::ready) {
       throw std::runtime_error("Reset timeout");
     }
+    fut.get();  // rethrow an exception from reset() instead of discarding it
 
     auto &env_impl = env_impls_[idx];
     elapsed_step_ = 0;
