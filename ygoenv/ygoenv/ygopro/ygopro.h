@@ -2030,6 +2030,8 @@ protected:
   std::string replay_time_str_;
   uint32_t replay_id4_ = 0;
   bool is_recording = false;
+  // set when max_steps ends the duel before the core reports a winner
+  bool truncated_ = false;
 
   // MSG_SELECT_COUNTER
   int n_counters_ = 0;
@@ -2258,6 +2260,7 @@ public:
     discard_hand_ = false;
 
     done_ = false;
+    truncated_ = false;
     step_count_ = 0;
 
     // update_time_stat(_start, reset_time_count_, reset_time_2_);
@@ -2532,6 +2535,7 @@ public:
     step_count_++;
     if (!done_ && (step_count_ >= spec_.config["max_steps"_])) {
       PlayerId winner = lp_[0] > lp_[1] ? 0 : 1;
+      truncated_ = true;  // the duel did not reach MSG_WIN
       _duel_end(winner, 0x01);
       done_ = true;
       legal_actions_.clear();
@@ -2592,7 +2596,11 @@ public:
         if (!is_recording) {
           throw std::runtime_error("Recording is not started");
         }
-        if (winner_ == 0 || winner_ == 1) {
+        if (truncated_) {
+          // A replay must end with MSG_WIN, or players report it as
+          // "not fully recorded".
+          fmt::println("[replay] duel cut off by max_steps, replay not saved");
+        } else if (winner_ == 0 || winner_ == 1) {
           save_replay();
         } else {
           fmt::println("[replay] duel ended without a winner, replay not saved");
