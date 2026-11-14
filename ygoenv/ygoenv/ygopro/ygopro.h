@@ -2875,7 +2875,9 @@ private:
     if (!hide) {
       f_cards(offset, 7) = attribute_to_id(c.attribute_);
       f_cards(offset, 8) = race_to_id(c.race_);
-      f_cards(offset, 9) = c.level_;
+      // The model's level embedding has 14 rows (0-13). An index outside it
+      // makes Flax return NaN for the whole observation, so clamp like ygoinf.
+      f_cards(offset, 9) = std::min<uint32_t>(c.level_, 13);
       f_cards(offset, 10) = std::min(c.counter_, static_cast<uint32_t>(15));
       f_cards(offset, 11) = static_cast<uint8_t>((c.status_ & (STATUS_DISABLED | STATUS_FORBIDDEN)) != 0);
       auto [atk1, atk2] = float_transform(c.attack_);

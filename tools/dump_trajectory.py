@@ -18,6 +18,8 @@ p.add_argument("--envs", type=int, default=8)
 p.add_argument("--seed", type=int, default=7)
 p.add_argument("--timeout", type=int, default=600)
 p.add_argument("--out")
+p.add_argument("--clamp-level", type=int, default=None,
+               help="clamp the card level feature before hashing (to compare with builds before the env clamped it)")
 args = p.parse_args()
 deck_path = os.path.abspath(os.path.expanduser(args.deck))
 os.chdir(ROOT / "scripts")
@@ -41,7 +43,10 @@ out = open(args.out, "w") if args.out else None
 def record(step, obs, extra):
     h = hashlib.sha256()
     for k in KEYS:
-        h.update(np.ascontiguousarray(obs[k]).tobytes())
+        a = obs[k]
+        if k == "cards_" and args.clamp_level is not None:
+            a = a.copy(); a[:, :, 9] = np.minimum(a[:, :, 9], args.clamp_level)
+        h.update(np.ascontiguousarray(a).tobytes())
     for x in extra:
         h.update(np.ascontiguousarray(x).tobytes())
     total.update(h.digest())
