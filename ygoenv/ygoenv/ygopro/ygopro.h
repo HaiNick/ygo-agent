@@ -3133,7 +3133,12 @@ private:
       // The model's level embedding has 14 rows (0-13). An index outside it
       // makes Flax return NaN for the whole observation, so clamp like ygoinf.
       f_cards(offset, 9) = std::min<uint32_t>(c.level_, 13);
-      f_cards(offset, 10) = std::min(c.counter_, static_cast<uint32_t>(15));
+      // counter_ is the query word of the first counter type: type | count << 16.
+      // Version 1 clamps the whole word, so the feature is 15 for any card
+      // with counters (C11). Version 2 writes the count.
+      f_cards(offset, 10) = obs_v2(to_play_)
+          ? std::min(c.counter_ >> 16, static_cast<uint32_t>(15))
+          : std::min(c.counter_, static_cast<uint32_t>(15));
       f_cards(offset, 11) = static_cast<uint8_t>((c.status_ & (STATUS_DISABLED | STATUS_FORBIDDEN)) != 0);
       auto [atk1, atk2] = float_transform(c.attack_);
       f_cards(offset, 12) = atk1;
