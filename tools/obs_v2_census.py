@@ -163,6 +163,7 @@ cur_decks = ["?", "?"]
 need_decks = True
 pending = None                        # last decision message since the previous step: (m, payload)
 pending_discard = None                # player of an End Phase discard with a real choice, not yet shown to the model
+pending_sort = None                   # player of a sort_card with 2 or more cards, not yet shown to the model
 
 
 def seat_receives(seat, m, b):
@@ -172,7 +173,7 @@ def seat_receives(seat, m, b):
 
 
 def feed(records):
-    global snapshot, need_decks, pending, pending_discard
+    global snapshot, need_decks, pending, pending_discard, pending_sort
     for kind, data in records:
         if kind == 0:
             for s in (env_st, full_st, *seat_st):
@@ -206,10 +207,15 @@ def feed(records):
                         # the next decision arrived and the model never saw the discard
                         flag("G_end_phase_discard_choice_by_env", pending_discard)
                         pending_discard = None
+                    if pending_sort is not None:
+                        flag("G_sort_card_2plus_by_env", pending_sort)
+                        pending_sort = None
                     # decisions the env answers by itself
                     if m == M["SORT_CARD"]:
                         flag("G_sort_card", pl)
-                        if b[1] > 1: flag("G_sort_card_2plus", pl)
+                        if b[1] > 1:
+                            flag("G_sort_card_2plus", pl)
+                            pending_sort = pl
                     elif m == M["SELECT_COUNTER"]:
                         flag("G_select_counter", pl)
                         if b[5] > 1: flag("G_select_counter_2cards", pl)
@@ -292,13 +298,15 @@ def deck_pick(m, b, p, obs, info):
 
 def census(obs, info):
     """Everything counted at a decision the model sees."""
-    global pending, pending_discard
+    global pending, pending_discard, pending_sort
     p = int(info["to_play"][0])
     cards = obs["cards_"][0]
     tot["decisions"] += 1
     by_deck[cur_decks[p]]["decisions"] += 1
     if pending_discard is not None:
         pending_discard = None  # the model is shown a decision of this selection
+    if pending_sort is not None and obs["actions_"][0][0, 3] == 17:
+        pending_sort = None     # the model is shown the sort
     # ---- A
     if pending is not None and pending[0] in (M["SELECT_CARD"], M["SELECT_UNSELECT_CARD"],
                                               M["SELECT_TRIBUTE"], M["SELECT_SUM"]):

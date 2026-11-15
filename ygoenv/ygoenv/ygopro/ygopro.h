@@ -786,6 +786,8 @@ static const std::vector<int> _msgs = {
     MSG_SELECT_OPTION,   MSG_SELECT_PLACE,     MSG_SELECT_SUM,
     MSG_SELECT_DISFIELD, MSG_ANNOUNCE_ATTRIB,  MSG_ANNOUNCE_NUMBER,
     MSG_ANNOUNCE_CARD,
+    // observation version 2 only (G2), appended so that ids 1 to 16 stay
+    MSG_SORT_CARD,
 };
 
 static const ankerl::unordered_dense::map<int, uint8_t> msg2id =
@@ -2068,7 +2070,8 @@ protected:
 
   // multi select
   int ms_idx_ = -1;
-  int ms_mode_ = 0;
+  int ms_mode_ = 0;  // 0: picks, 1: combinations (select_sum), 2: order (sort_card, version 2)
+  int sort_resp_len_ = 1;
   int ms_min_ = 0;
   int ms_max_ = 0;
   int ms_must_ = 0;
@@ -2394,7 +2397,7 @@ public:
       ms_spec2idx_[spec] = j;
     }
 
-    if (ms_mode_ == 0) {
+    if (ms_mode_ != 1) {
       for (int j = 0; j < ms_specs_.size(); ++j) {
         const auto &spec = ms_specs_[j];
         legal_actions_.push_back(LegalAction::from_spec(spec));
@@ -2407,7 +2410,7 @@ public:
 
   void handle_multi_select() {
     legal_actions_.clear();
-    if (ms_mode_ == 0) {
+    if (ms_mode_ != 1) {
       for (int j = 0; j < ms_specs_.size(); ++j) {
         if (ms_spec2idx_.find(ms_specs_[j]) != ms_spec2idx_.end()) {
           legal_actions_.push_back(
@@ -2530,6 +2533,11 @@ public:
         }
         fmt::println("specs: {}, idx: {}, spec: {}", specs, idx, action.spec_);
         ms_idx_ = -1;
+        if (ms_mode_ == 2) {
+          resp_buf_[0] = 255;  // sort_card: default order
+          YGO_SetResponseb(pduel_, resp_buf_);
+          return;
+        }
         resp_buf_[0] = ms_min_;
         for (int i = 0; i < ms_min_; ++i) {
           resp_buf_[i + 1] = i;
@@ -2538,7 +2546,27 @@ public:
         return;
       }
     }
-    if (finish) {
+    if (finish && ms_mode_ == 2) {
+      // MSG_SORT_CARD (version 2): the answer is the place of every card,
+      // 0 = on top. The k-th pick gets place k, the card that is left the
+      // last place.
+      ms_idx_ = -1;
+      int n = ms_specs_.size();
+      std::vector<char> picked(n, 0);
+      for (int k = 0; k < static_cast<int>(ms_r_idxs_.size()); ++k) {
+        resp_buf_[ms_r_idxs_[k]] = k;
+        picked[ms_r_idxs_[k]] = 1;
+      }
+      int place = ms_r_idxs_.size();
+      for (int i = 0; i < n; ++i) {
+        if (!picked[i]) {
+          resp_buf_[i] = place++;
+        }
+      }
+      sort_resp_len_ = n;
+      YGO_SetResponseb(pduel_, resp_buf_);
+      sort_resp_len_ = 1;
+    } else if (finish) {
       ms_idx_ = -1;
       resp_buf_[0] = ms_r_idxs_.size();
       for (int i = 0; i < ms_r_idxs_.size(); ++i) {
@@ -3369,7 +3397,8 @@ private:
     _set_obs_action_msg(feat, i, msg);
     _set_obs_action_card_id(feat, i, action.cid_);
     if (msg == MSG_SELECT_CARD || msg == MSG_SELECT_TRIBUTE ||
-        msg == MSG_SELECT_SUM || msg == MSG_SELECT_UNSELECT_CARD) {
+        msg == MSG_SELECT_SUM || msg == MSG_SELECT_UNSELECT_CARD ||
+        msg == MSG_SORT_CARD) {
       if (action.finish_) {
         _set_obs_action_finish(feat, i);
       } else {
@@ -3613,8 +3642,9 @@ private:
     if (record_ && is_recording) {
       switch (msg_) {
         case MSG_SORT_CARD:
-          ReplayWriteInt8(1);
-          ReplayWriteData(buf, 1);
+          // 1 byte (255 = default order), or one place per card (version 2)
+          ReplayWriteInt8(sort_resp_len_);
+          ReplayWriteData(buf, sort_resp_len_);
           break;
         case MSG_SELECT_COUNTER:
           ReplayWriteInt8(2 * n_counters_);
@@ -4829,6 +4859,34 @@ private:
         str = str.replace(str.find(fmt_str), fmt_str.length(), card.name_);
         players_[pl]->notify(str);
       }
+    } else if (msg_ == MSG_SORT_CARD && obs_v2(data_[dp_]) && data_[dp_ + 1] >= 2) {
+      // Version 2 (docs/OBS_V2.md, G2): the model orders the cards. The only
+      // sender is the core's deck sort (Duel.SortDecktop): "which of these
+      // cards goes on top next", one pick per card, as a card selection with
+      // its own message id. The last card needs no pick. Version 1, and a
+      // single card, keep the default order below.
+      auto player = read_u8();
+      auto size = read_u8();
+      std::vector<std::string> specs;
+      specs.reserve(size);
+      for (int i = 0; i < size; ++i) {
+        CardCode code = read_u32();
+        auto c = read_u8();
+        auto loc = read_u8();
+        auto seq = read_u8();
+        auto spec = ls_to_spec(loc, seq, 0, c != player);
+        specs.push_back(spec);
+        note_confirmed_spec(player, c, loc, seq, spec, code);
+        note_own_deck_spec(player, c, loc, spec, code);
+        if (verbose_) {
+          players_[player]->notify(fmt::format("{}: {}", i + 1, c_get_card(code).name_));
+        }
+      }
+      init_multi_select(size - 1, size - 1, 0, specs, 2);
+      to_play_ = player;
+      callback_ = [this](int idx) {
+        _callback_multi_select(idx, ms_max_ == 1);
+      };
     } else if (msg_ == MSG_SORT_CARD) {
       // TODO(3): implement action
       if (!verbose_) {

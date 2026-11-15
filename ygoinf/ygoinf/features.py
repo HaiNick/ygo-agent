@@ -245,6 +245,7 @@ msg_to_id = {
     MsgName.announce_attrib: 14,
     MsgName.announce_number: 15,
     MsgName.announce_card: 16,
+    MsgName.sort_card: 17,  # observation version 2 only
 }
 
 
@@ -984,6 +985,25 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             action.card_id = get_code_id(code)
             action.response = code
             actions.append(action)
+    elif action_msg.data.msg_type == "sort_card":
+        msg: MsgSortCard = action_msg.data
+        if OBS_VERSION < 2:
+            raise NotImplementedError("sort_card needs observation version 2 (version 1 keeps the default order)")
+        if len(msg.cards) - len(msg.selected) < 2:
+            raise NotImplementedError("sort_card: the last card needs no pick")
+        actions = []
+        for i, c in enumerate(msg.cards):
+            if i in msg.selected:
+                continue
+            action = LegalAction(msg=MsgName.sort_card)
+            action.response = c.response
+            action.spec = to_spec(c.location)
+            action.msg_code = c.code
+            action.deck_code = own_deck_code(c.location, c.code)
+            if c.confirmed and c.code:
+                action.card_id = get_code_id(c.code)
+                action.hint = True
+            actions.append(action)
     elif action_msg.data.msg_type == "select_unselect_card":
         actions = []
         msg: MsgSelectUnselectCard = action_msg.data
@@ -1156,6 +1176,12 @@ def add_skipped_back(probs, legal_actions, action_msg: ActionMsg):
             i = types.index(ep)
             probs.insert(i, -1)
             responses.insert(i, 7 if msg_type == "select_idlecmd" else 3)
+            can_finish.insert(i, False)
+
+    if msg_type == "sort_card":
+        for i in sorted(action_msg.data.selected):
+            probs.insert(i, -1)
+            responses.insert(i, action_msg.data.cards[i].response)
             can_finish.insert(i, False)
 
     if msg_type in ["select_card", "select_tribute", "select_sum"]:

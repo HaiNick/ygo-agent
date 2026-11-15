@@ -375,6 +375,7 @@ class RefClient:
     def __init__(self, F, Mo, view, card_data, obs_version=1):
         self.F, self.Mo, self.view = F, Mo, view
         self.v2 = obs_version >= 2
+        self.sort_by_model = self.v2
         # one state equal to the env's (version 1, env view), else one per seat
         self.single = view == "env" and not self.v2
         self.sort_deck = view == "client"
@@ -690,6 +691,14 @@ class RefClient:
             return dict(msg_type="announce_card", opcodes=[u32(b, 2 + 4 * i) for i in range(b[1])],
                         seen=dict(me=list(st.seen[p]), opponent=list(st.seen[1 - p])),
                         deck_main=main, deck_extra=extra)
+        if m == M["SORT_CARD"]:
+            cards = []
+            for i in range(b[1]):
+                o = 2 + 7 * i
+                code = u32(b, o); c, l, s = b[o + 4], b[o + 5], b[o + 6]
+                conf = l in (LOCATION_DECK, LOCATION_EXTRA) and code in st.confirmed.get((c << 8) | l, [])
+                cards.append(dict(location=L(c, l, s, 0), response=i, code=code, confirmed=conf))
+            return dict(msg_type="sort_card", cards=cards, selected=list(d["selected"]))
         if m == M["SELECT_SUM"]:
             o = 8
             def rd(o):
@@ -713,6 +722,8 @@ class RefClient:
     def env_auto(self, d):
         """Decisions the env answers without any legal action."""
         m, b = d["m"], d["b"]
+        if m == M["SORT_CARD"] and self.sort_by_model and b[1] >= 2:
+            return False  # observation version 2 with G2: the model orders the cards
         if m in (M["SELECT_COUNTER"], M["SORT_CARD"]):
             return True
         if m == M["SELECT_CHAIN"] and b[1] == 0 and b[2] == 0:
@@ -1039,6 +1050,9 @@ def advance(client, d, inp, preds, j):
             return True
         d["selected"].append(preds[j].response)
         return False
+    if m == M["SORT_CARD"]:
+        d["selected"].append(preds[j].response)
+        return len(d["selected"]) >= len(inp.action_msg.data.cards) - 1
     return True
 
 

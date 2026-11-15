@@ -420,6 +420,29 @@ class MsgName(Enum):
     announce_attrib = 'announce_attrib'
     announce_number = 'announce_number'
     announce_card = 'announce_card'
+    sort_card = 'sort_card'
+
+
+class SortCard(BaseModel):
+    location: CardLocation
+    response: int = Field(..., description='Index of the card in MSG_SORT_CARD')
+    code: int = Field(0, description='The card code as given in the message')
+    confirmed: bool = Field(
+        False,
+        description='As for select_card: true for a card in the deck or extra deck whose code was shown to '
+                    'this player since the last MSG_CHAIN_SOLVED.',
+    )
+
+
+class MsgSortCard(BaseModel):
+    """Observation version 2 only. MSG_SORT_CARD (the core's deck sort) as repeated picks: "which
+    of these cards goes on top next". Send one request per pick with the picks so far in
+    `selected`, until one card is left (n - 1 requests for n cards, none for a single card). The
+    answer to the core is one byte per card of the message: its place, 0 = on top. The k-th pick
+    gets place k (from 0), the card that is left the last place."""
+    msg_type: Literal['sort_card']
+    cards: List[SortCard]
+    selected: List[int] = Field(..., description='Indices (response values) of the cards picked so far, in pick order')
 
 
 class SelectUnselectCard(BaseModel):
@@ -484,6 +507,7 @@ class ActionMsg(BaseModel):
         MsgAnnounceAttrib,
         MsgAnnounceNumber,
         MsgAnnounceCard,
+        MsgSortCard,
     ] = Field(..., discriminator='msg_type')
 
 
