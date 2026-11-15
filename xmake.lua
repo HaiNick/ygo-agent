@@ -45,6 +45,30 @@ target("yrp_verify")
     set_languages("c++17")
 
 
+target("ygopro_parity")
+    -- test helper: the env plus a record of the client's view (tools/ygoinf_parity.py)
+    set_default(false)
+    add_rules("python.library")
+    add_files("tests/ygoinf_parity_env.cpp")
+    add_packages("pybind11", "fmt", "glog", "concurrentqueue", "sqlitecpp", "unordered_dense", "ygopro-core", "xz")
+    if is_config("replay_format", "yrp1") then
+        add_defines("YGO_REPLAY_YRP1")
+    elseif is_config("replay_format", "yrp2_nolzma") then
+        add_defines("YGO_REPLAY_NOLZMA")
+    end
+    set_languages("c++17")
+    if is_mode("release") then
+        set_policy("build.optimization.lto", true)
+        add_cxxflags("-march=native")
+    end
+    add_includedirs("ygoenv")
+
+    after_build(function (target)
+        os.cp(target:targetfile(), "$(projectdir)/tests/")
+        print("Copy target to tests/")
+    end)
+
+
 target("ygopro_ygoenv")
     add_rules("python.library")
     add_files("ygoenv/ygoenv/ygopro/*.cpp")

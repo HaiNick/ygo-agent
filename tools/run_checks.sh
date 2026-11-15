@@ -13,7 +13,7 @@
 #   While training runs: XLA_PYTHON_CLIENT_PREALLOCATE=false is set here.
 #
 # quick: build, duel registry stress, embedding rows, record + yrp_verify (2 decks),
-#        determinism digests, finite model outputs, ygoinf encoding, deck lint
+#        determinism digests, finite model outputs, ygoinf encoding and env parity, deck lint
 # full:  quick + record all decks, tripwire (vs random and vs the option-0 bot),
 #        random self-play per deck (0 Lua errors, 0 crashes)
 set -uo pipefail
@@ -41,7 +41,7 @@ for f in scripts/script/constant.lua assets/locale/en/cards.cdb "$CKPT"; do
   [[ -e "$f" ]] || { echo "missing $f (link scripts/script, assets/locale and scripts/checkpoints into this checkout)"; exit 2; }
 done
 
-step "build" bash -c 'xmake f -m release -y >/dev/null && xmake b -y ygopro_ygoenv && xmake b -y yrp_verify && xmake b -y duel_registry_stress'
+step "build" bash -c 'xmake f -m release -y >/dev/null && xmake b -y ygopro_ygoenv && xmake b -y yrp_verify && xmake b -y duel_registry_stress && xmake b -y ygopro_parity'
 STRESS="$(find build -name duel_registry_stress -type f | head -1)"
 step "duel registry stress" "$STRESS" locked 16 20000
 step "embedding rows" python tools/test_embedding_rows.py "$CKPT" --num-embeddings 15017

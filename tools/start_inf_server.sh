@@ -7,6 +7,9 @@
 #   CHECKPOINT      path to .flax_model (default: scripts/checkpoints/ft_r4_100M_main15017.flax_model)
 #   CODE_LIST       path to code_list.txt (default: ~/ygo/ygo-agent/scripts/code_list.txt)
 #   NUM_EMBEDDINGS  embedding table size (default: 15017)
+#   CARDS_DB        cards.cdb for card-name declarations (default: assets/locale/en/cards.cdb)
+#   ANNOUNCE_POOL   deck files or folders (':'-separated) that rank declaration candidates,
+#                   the decks the env loads in training (default: ~/ygo/decks/train)
 #   HOST            bind host (default: 127.0.0.1)
 #   PORT            bind port (default: 3000)
 set -euo pipefail
@@ -35,6 +38,8 @@ export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
 export CHECKPOINT="$CKPT"
 export CODE_LIST="${CODE_LIST:-$REPO/scripts/code_list.txt}"
 export NUM_EMBEDDINGS="${NUM_EMBEDDINGS:-15017}"
+export CARDS_DB="${CARDS_DB:-$REPO/assets/locale/en/cards.cdb}"
+export ANNOUNCE_POOL="${ANNOUNCE_POOL:-$HOME/ygo/decks/train}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-3000}"
 
@@ -46,6 +51,8 @@ echo "  JAX_PLATFORMS=$JAX_PLATFORMS"
 echo "  CHECKPOINT=$CHECKPOINT"
 echo "  CODE_LIST=$CODE_LIST"
 echo "  NUM_EMBEDDINGS=$NUM_EMBEDDINGS"
+echo "  CARDS_DB=$CARDS_DB"
+echo "  ANNOUNCE_POOL=$ANNOUNCE_POOL"
 
 cd "$REPO/ygoinf"
 exec uvicorn ygoinf.server:app --host "$HOST" --port "$PORT"

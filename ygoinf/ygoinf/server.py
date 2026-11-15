@@ -20,7 +20,7 @@ from .models import (
     DuelPredictResponse,
     DuelPredictErrorResponse,
 )
-from .features import predict, init_code_list, PredictState, Predictor
+from .features import predict, init_code_list, init_announce, PredictState, Predictor
 
 
 class Settings(BaseSettings):
@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     state_expire: int = Field(default=3600, description="Duel state expire time in seconds")
     test_duel_id: str = Field(default="9654823a-23fd-4850-bb-6fec241740b0", description="Test duel id")
     ygo_num_threads: int = Field(default=1, description="Number of threads to use for YGO prediction")
+    cards_db: str = Field(default="", description="cards.cdb for card-name declarations (the one the env loads)")
+    announce_pool: str = Field(
+        default="",
+        description="Deck files or folders, separated by ':', that the env loaded (init_ygopro --deck). "
+                    "They rank the candidates of a card-name declaration. Empty: announce_card is refused.")
 
 settings = Settings()
 
@@ -54,6 +59,11 @@ thread.start()
 @asynccontextmanager
 async def lifespan(app: FastAPI):    
     init_code_list(settings.code_list)
+    if settings.cards_db and settings.announce_pool:
+        ctx = init_announce(settings.cards_db, [p for p in settings.announce_pool.split(":") if p])
+        print(f"announce_card: {len(ctx.pool_decks)} pool decks, {len(ctx.pool_ranked)} pool codes")
+    else:
+        print("announce_card disabled: set CARDS_DB and ANNOUNCE_POOL")
 
     checkpoint = settings.checkpoint
     predictor = Predictor.load(checkpoint, settings.ygo_num_threads)
@@ -135,7 +145,7 @@ async def duel_predict(
     _start = time.time()    
     try:
         predict_results = predict(model_fn, body.input, body.prev_action_idx, duel_state)
-    except (KeyError, NotImplementedError) as e:
+    except (KeyError, ValueError, NotImplementedError) as e:
         return DuelPredictErrorResponse(
             error=f"{e}"
         )
