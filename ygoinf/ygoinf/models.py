@@ -92,7 +92,13 @@ class MsgSelectOption(BaseModel):
 class CardLocation(BaseModel):
     controller: Controller = Field(..., examples=['me'])
     location: Location = Field(..., examples=['hand', 'deck'])
-    sequence: int = Field(..., description='Start from 0')
+    sequence: int = Field(
+        ...,
+        description="Start from 0. For a card in this player's own deck, send the sequence from the message "
+                    "unchanged (in the card selection messages the core numbers such cards 0, 1, 2, ... "
+                    "instead of giving their place in the deck) and send the card's code in the code field. "
+                    "With observation version 2 ygoinf finds the card row by that code.",
+    )
     overlay_sequence: int = Field(
         ...,
         description='if is overlay, this is the overlay index, starting from 0, else -1.',
@@ -483,7 +489,14 @@ class ActionMsg(BaseModel):
 
 class Input(BaseModel):
     global_: Global = Field(..., alias='global')
-    cards: List[Card] = Field(..., max_items=160, min_items=2)
+    cards: List[Card] = Field(
+        ..., max_items=160, min_items=2,
+        description="All cards, own cards first, then the opponent's. Per player: deck, hand, monster zones, "
+                    "spell zones, graveyard, banished, extra deck. Per location in core sequence order, with "
+                    "one exception: the cards remaining in this player's own deck may come in any order. A "
+                    "client doesn't know the order of its shuffled deck, and the model can't see the order "
+                    "of the card rows. Send one entry per remaining deck card with its code.",
+    )
     action_msg: ActionMsg
 
 
