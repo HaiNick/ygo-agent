@@ -5423,7 +5423,10 @@ private:
 
       if (discard_hand_) {
         discard_hand_ = false;
-        if (current_phase_ == PHASE_END) {
+        // Version 1 discards for the hand size limit at random, without the
+        // model and without a history entry. Version 2 (docs/OBS_V2.md, G1)
+        // takes the normal card selection path below.
+        if (current_phase_ == PHASE_END && !obs_v2(player)) {
           // random discard
           std::vector<int> comb(size);
           std::iota(comb.begin(), comb.end(), 0);
