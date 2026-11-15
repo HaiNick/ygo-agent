@@ -251,6 +251,29 @@ class MsgSelectCard(BaseModel):
     )
 
 
+class AnnounceSeen(BaseModel):
+    me: List[int] = Field(..., description='Codes revealed by cards this player controls, oldest first')
+    opponent: List[int] = Field(..., description='Codes revealed by cards the opponent controls, oldest first')
+
+
+class MsgAnnounceCard(BaseModel):
+    msg_type: Literal['announce_card']
+    opcodes: List[int] = Field(
+        ..., description='The opcodes of MSG_ANNOUNCE_CARD, unchanged (uint32 values)')
+    seen: AnnounceSeen = Field(
+        ...,
+        description='Codes revealed this duel, tracked the way the env does (track_seen_codes in '
+                    'ygopro.h). A code is added to the list of the player in the message when the client '
+                    'receives: MSG_SUMMONING, MSG_SPSUMMONING, MSG_FLIPSUMMONING, MSG_CHAINING (player = '
+                    'controller byte of the location); MSG_MOVE to the graveyard, or face-up to the field, '
+                    'banishment or extra deck (player = new controller); MSG_POS_CHANGE to a face-up '
+                    'position; each card of MSG_CONFIRM_CARDS, MSG_CONFIRM_DECKTOP, MSG_CONFIRM_EXTRATOP '
+                    '(player = card controller). A code already in the list moves to the end. Reset per duel.',
+    )
+    deck_main: List[int] = Field(..., description="This player's main deck list")
+    deck_extra: List[int] = Field(..., description="This player's extra deck list")
+
+
 class Race(Enum):
     none = 'none'
     warrior = 'warrior'
@@ -390,6 +413,7 @@ class MsgName(Enum):
     select_disfield = 'select_disfield'
     announce_attrib = 'announce_attrib'
     announce_number = 'announce_number'
+    announce_card = 'announce_card'
 
 
 class SelectUnselectCard(BaseModel):
@@ -453,6 +477,7 @@ class ActionMsg(BaseModel):
         MsgSelectDisfield,
         MsgAnnounceAttrib,
         MsgAnnounceNumber,
+        MsgAnnounceCard,
     ] = Field(..., discriminator='msg_type')
 
 

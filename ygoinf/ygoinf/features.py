@@ -244,7 +244,24 @@ msg_to_id = {
     MsgName.select_disfield: 13,
     MsgName.announce_attrib: 14,
     MsgName.announce_number: 15,
+    MsgName.announce_card: 16,
 }
+
+
+# Card-name declarations need card data and the deck pool (see announce.py).
+announce_ctx = None
+
+
+def init_announce(cards_db, pool_paths):
+    """Load what MSG_ANNOUNCE_CARD needs. Call after init_code_list.
+    cards_db: the cards.cdb the env loads. pool_paths: deck files or folders,
+    the decks the env loaded (init_ygopro --deck)."""
+    global announce_ctx
+    from .announce import AnnounceContext, load_card_data, load_pool
+    order = sorted((i, c) for c, i in code_to_id.items() if c != 0)
+    codes = [c for _, c in order]
+    announce_ctx = AnnounceContext(load_card_data(cards_db, codes), code_to_id, codes, load_pool(pool_paths))
+    return announce_ctx
 
 
 class ActionAct(Enum):
@@ -876,6 +893,21 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             action = LegalAction(msg=MsgName.announce_number)
             action.response = number.response
             action.number = number.number
+            actions.append(action)
+    elif action_msg.data.msg_type == "announce_card":
+        msg: MsgAnnounceCard = action_msg.data
+        if announce_ctx is None:
+            raise NotImplementedError(
+                "announce_card needs the server settings cards_db and announce_pool (init_announce)")
+        from .announce import announce_candidates
+        codes = announce_candidates(
+            announce_ctx, msg.opcodes, msg.seen.opponent, msg.seen.me,
+            msg.deck_main, msg.deck_extra, MAX_ACTIONS)
+        actions = []
+        for code in codes:
+            action = LegalAction(msg=MsgName.announce_card)
+            action.card_id = get_code_id(code)
+            action.response = code
             actions.append(action)
     elif action_msg.data.msg_type == "select_unselect_card":
         actions = []
