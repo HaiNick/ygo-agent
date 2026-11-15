@@ -1859,7 +1859,11 @@ public:
                     "max_cards"_.Bind(80), "n_history_actions"_.Bind(16),
                     "record"_.Bind(false), "async_reset"_.Bind(false),
                     "greedy_reward"_.Bind(true), "timeout"_.Bind(600),
-                    "oppo_info"_.Bind(false), "max_steps"_.Bind(1000));
+                    "oppo_info"_.Bind(false), "max_steps"_.Bind(1000),
+                    // Observation version, see docs/OBS_V2.md. 1 is the
+                    // observation every checkpoint up to ft_r4 was trained
+                    // on and must stay bit-identical.
+                    "obs_version"_.Bind(1));
   }
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
@@ -2054,6 +2058,10 @@ protected:
   // MSG_SELECT_COUNTER
   int n_counters_ = 0;
 
+  // Observation version per seat (config obs_version). Everything that
+  // differs from version 1 asks obs_v2(player) for the player it concerns.
+  int obs_version_[2] = {1, 1};
+
   std::mt19937 gen_;
 
   std::mt19937 duel_gen_;
@@ -2084,6 +2092,12 @@ public:
     gen_ = std::mt19937(env_seed);
     duel_gen_ = std::mt19937(dist_int_(gen_));
 
+    int obs_version = spec.config["obs_version"_];
+    if (obs_version != 1 && obs_version != 2) {
+      throw std::runtime_error(fmt::format("Unknown obs_version {}", obs_version));
+    }
+    obs_version_[0] = obs_version_[1] = obs_version;
+
     int max_options = spec.config["max_options"_];
     int n_action_feats = spec.state_spec["obs:actions_"_].shape[1];
     history_actions_1_ = TArray<uint8_t>(Array(
@@ -2093,6 +2107,9 @@ public:
   }
 
   int max_options() const { return spec_.config["max_options"_]; }
+
+  // true if this seat gets observation version 2
+  bool obs_v2(PlayerId player) const { return obs_version_[player & 1] >= 2; }
 
   int max_cards() const { return spec_.config["max_cards"_]; }
 

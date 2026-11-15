@@ -4,6 +4,7 @@ Catches observation features that index outside an embedding table (Flax returns
 as a card level above 13 did before the env clamped it.
 
 usage: python tools/check_finite.py CKPT [--deck DIR] [--steps 400] [--envs 64] [--num-embeddings 15017]
+       [--obs-version 1]
 exit code 0 = every decision had finite logits (over the legal options) and a finite value.
 """
 import argparse, os, sys
@@ -17,6 +18,7 @@ p.add_argument("--steps", type=int, default=400)
 p.add_argument("--envs", type=int, default=64)
 p.add_argument("--num-embeddings", type=int, default=15017)
 p.add_argument("--seed", type=int, default=77)
+p.add_argument("--obs-version", type=int, default=1, help="observation version of the env (docs/OBS_V2.md)")
 args = p.parse_args()
 ckpt = os.path.abspath(os.path.expanduser(args.checkpoint))
 deck_path = os.path.abspath(os.path.expanduser(args.deck))
@@ -32,7 +34,7 @@ n = args.envs
 deck = init_ygopro("YGOPro-v1", "english", deck_path, "code_list.txt")
 envs = ygoenv.make(task_id="YGOPro-v1", env_type="gymnasium", num_envs=n, num_threads=min(n, 12), seed=args.seed,
                    deck1=deck, deck2=deck, max_options=24, n_history_actions=32, play_mode="self",
-                   async_reset=False, greedy_reward=False, oppo_info=False)
+                   async_reset=False, greedy_reward=False, oppo_info=False, obs_version=args.obs_version)
 agent = RNNAgent(embedding_shape=args.num_embeddings)
 sample_obs = jax.tree.map(lambda x: jnp.array([x]), envs.observation_space.sample())
 params = jax.jit(agent.init)(jax.random.PRNGKey(0), sample_obs, agent.init_rnn_state(1))
@@ -65,5 +67,5 @@ for _ in range(args.steps):
     action = np.minimum(np.where(ok, action, 0), nopt - 1).astype(np.int32)
     obs, _, term, trunc, info = envs.step(action)
     done = term | trunc
-print(f"decisions={total} non_finite={bad} max_level_feature={max_level}")
+print(f"obs_version={args.obs_version} decisions={total} non_finite={bad} max_level_feature={max_level}")
 sys.exit(1 if bad else 0)

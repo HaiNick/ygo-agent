@@ -87,6 +87,8 @@ class Args:
     """the number of history actions to use"""
     greedy_reward: bool = False
     """whether to use greedy reward (faster kill higher reward)"""
+    obs_version: int = 1
+    """the observation version of the env (docs/OBS_V2.md); 1 is what every checkpoint up to ft_r4 was trained on"""
 
     total_timesteps: int = 50000000000
     """total timesteps of the experiments"""
@@ -244,6 +246,7 @@ def make_env(args, seed, num_envs, num_threads, mode='self', thread_affinity_off
         play_mode=mode,
         timeout=args.timeout,
         oppo_info=False,
+        obs_version=args.obs_version,
     )
     envs.num_envs = num_envs
     return envs

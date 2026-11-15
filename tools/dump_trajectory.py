@@ -4,7 +4,7 @@ Two env builds are behavior-identical if this prints the same digest for both. R
 build (select the build with PYTHONPATH=<checkout>/ygoenv:<checkout>) and compare the output.
 
 usage: python tools/dump_trajectory.py DECK_DIR [--games 32] [--envs 8] [--seed 7] [--out FILE]
-       [--timeout 600]
+       [--timeout 600] [--obs-version 1]
 The last line is "digest <sha256> games <n> steps <n>". --out writes one hash per step.
 """
 import argparse, hashlib, os, sys
@@ -20,6 +20,7 @@ p.add_argument("--timeout", type=int, default=600)
 p.add_argument("--out")
 p.add_argument("--clamp-level", type=int, default=None,
                help="clamp the card level feature before hashing (to compare with builds before the env clamped it)")
+p.add_argument("--obs-version", type=int, default=1, help="observation version of the env (docs/OBS_V2.md)")
 args = p.parse_args()
 deck_path = os.path.abspath(os.path.expanduser(args.deck))
 os.chdir(ROOT / "scripts")
@@ -33,7 +34,8 @@ n = args.envs
 envs = ygoenv.make(
     task_id="YGOPro-v1", env_type="gymnasium", num_envs=n, num_threads=n, seed=args.seed,
     deck1=deck, deck2=deck, max_options=24, n_history_actions=32, play_mode="self",
-    async_reset=False, greedy_reward=False, timeout=args.timeout, oppo_info=False)
+    async_reset=False, greedy_reward=False, timeout=args.timeout, oppo_info=False,
+    **({} if args.obs_version == 1 else {"obs_version": args.obs_version}))
 rng = np.random.default_rng(args.seed)
 KEYS = ("cards_", "global_", "actions_", "h_actions_")
 total = hashlib.sha256()

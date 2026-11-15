@@ -44,6 +44,8 @@ class Args:
     """the number of history actions to use for the environment"""
     oppo_info: bool = False
     """whether to use opponent information"""
+    obs_version: int = 1
+    """the observation version of the env (docs/OBS_V2.md), for both agents"""
     num_embeddings: Optional[int] = None
     """the number of embeddings of the agent"""
     accurate: bool = True
@@ -152,6 +154,7 @@ if __name__ == "__main__":
         deck1=args.deck1,
         deck2=args.deck2,
         oppo_info=args.oppo_info,
+        obs_version=args.obs_version,
         **env_option,
     )
     envs.num_envs = num_envs
