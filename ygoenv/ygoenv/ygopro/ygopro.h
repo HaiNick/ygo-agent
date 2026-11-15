@@ -1863,7 +1863,17 @@ public:
                     // Observation version, see docs/OBS_V2.md. 1 is the
                     // observation every checkpoint up to ft_r4 was trained
                     // on and must stay bit-identical.
-                    "obs_version"_.Bind(1));
+                    "obs_version"_.Bind(1),
+                    // Per-seat versions, for evaluating a model of one
+                    // version against a model of the other (battle.py):
+                    // obs_version is player 0's version, obs_version2
+                    // player 1's (0 = the same). Envs with an id of at
+                    // least obs_version_swap_from (-1 = none) start with the
+                    // two swapped. With obs_version_alternate every env
+                    // swaps them at each new duel after its first.
+                    "obs_version2"_.Bind(0),
+                    "obs_version_swap_from"_.Bind(-1),
+                    "obs_version_alternate"_.Bind(false));
   }
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
@@ -1935,6 +1945,11 @@ public:
   void set_crash_slot(int slot, int env_id) {
     crash_slot_ = slot;
     crash_env_id_ = env_id;
+    // per-seat observation versions: this env starts with the seats swapped
+    int swap_from = spec_.config["obs_version_swap_from"_];
+    if (swap_from >= 0 && env_id >= swap_from) {
+      std::swap(obs_version_[0], obs_version_[1]);
+    }
   }
 
 protected:
@@ -2119,7 +2134,12 @@ public:
     if (obs_version != 1 && obs_version != 2) {
       throw std::runtime_error(fmt::format("Unknown obs_version {}", obs_version));
     }
-    obs_version_[0] = obs_version_[1] = obs_version;
+    int obs_version2 = spec.config["obs_version2"_];
+    if (obs_version2 != 0 && obs_version2 != 1 && obs_version2 != 2) {
+      throw std::runtime_error(fmt::format("Unknown obs_version2 {}", obs_version2));
+    }
+    obs_version_[0] = obs_version;
+    obs_version_[1] = obs_version2 == 0 ? obs_version : obs_version2;
 
     int max_options = spec.config["max_options"_];
     int n_action_feats = spec.state_spec["obs:actions_"_].shape[1];
@@ -2207,6 +2227,11 @@ public:
       } else {
         ai_player_ = player_;
       }
+    }
+
+    if (spec_.config["obs_version_alternate"_] && episode_count_ > 0) {
+      // battle.py switches the two agents' seats of an env at each new game
+      std::swap(obs_version_[0], obs_version_[1]);
     }
 
     turn_count_ = 0;

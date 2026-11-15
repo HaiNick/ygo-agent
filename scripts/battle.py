@@ -46,6 +46,11 @@ class Args:
     """whether to use opponent information"""
     obs_version: int = 1
     """the observation version of the env (docs/OBS_V2.md), for both agents"""
+    obs_version1: Optional[int] = None
+    """the observation version checkpoint1 was trained on, defaults to `obs_version`"""
+    obs_version2: Optional[int] = None
+    """the observation version checkpoint2 was trained on, defaults to `obs_version`.
+    With two different versions each agent gets its own in the same game."""
     num_embeddings: Optional[int] = None
     """the number of embeddings of the agent"""
     accurate: bool = True
@@ -148,13 +153,30 @@ if __name__ == "__main__":
         verbose=args.verbose,
         record=args.record,
     )
+    v1 = args.obs_version1 or args.obs_version
+    v2 = args.obs_version2 or args.obs_version
+    if v1 == v2:
+        obs_option = dict(obs_version=v1)
+    else:
+        # The env gives each seat its version. The agents' seats follow
+        # main_player below: checkpoint1 is player 0 in the first half of the
+        # envs and player 1 in the rest (the other way round with --reverse),
+        # and an env switches the seats at each new game.
+        if args.reverse:
+            obs_option = dict(obs_version=v2, obs_version2=v1, obs_version_swap_from=num_envs - num_envs // 2)
+        else:
+            obs_option = dict(obs_version=v1, obs_version2=v2, obs_version_swap_from=num_envs // 2)
+        if num_envs == 1:
+            obs_option["obs_version_swap_from"] = -1
+        obs_option["obs_version_alternate"] = True
+        print(f"Observation versions: checkpoint1 {v1}, checkpoint2 {v2}")
     envs = ygoenv.make(
         task_id=args.env_id,
         n_history_actions=args.n_history_actions,
         deck1=args.deck1,
         deck2=args.deck2,
         oppo_info=args.oppo_info,
-        obs_version=args.obs_version,
+        **obs_option,
         **env_option,
     )
     envs.num_envs = num_envs
