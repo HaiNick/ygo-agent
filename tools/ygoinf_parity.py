@@ -21,10 +21,19 @@ Two views of the game (--view):
           privately that the env exposes (C9). The verdict of the test.
   client  The client uses only what it receives: all messages (none dropped),
           only confirmations sent to its own seat, and its own deck sorted by
-          code because the deck order is unknown. A difference here is
+          code because the deck order is unknown. Messages still name deck
+          cards by the core's sequence, which the client's rows don't follow,
+          so ygoinf finds the row by the card's code. A difference here is
           information a real client can't send. It's reported, not judged.
   client-deck  Like client, but with the true order of the own deck, to separate the
           deck order from the other gaps.
+
+In the two client views the own-deck rows of both sides are brought into one
+canonical order before the comparison (canon_own_deck: sorted by row bytes,
+actions_ column 0 moved with them, equal rows interchangeable). The model
+can't see the order of the card rows, so this is the comparison that matters
+for a client that doesn't know its deck order. The env view compares the
+arrays as they are.
 
 Hidden cards: the env writes an opponent card in the deck, hand or extra deck
 as a count-only row (location and owner, position 0) unless the env's
@@ -355,6 +364,10 @@ class RefClient:
     def __init__(self, F, Mo, view, card_data):
         self.F, self.Mo, self.view = F, Mo, view
         self.sort_deck = view == "client"
+        # Compare the own-deck rows in one canonical order (canon_own_deck).
+        # The env view keeps the exact comparison: there the client is given
+        # the env's deck order, so the arrays must be equal as they are.
+        self.canonical_deck = view != "env"
         self.cd = card_data
         # env view: one state equal to the env's. client view: one per seat.
         self.states = [DuelState()] if view == "env" else [DuelState(), DuelState()]
@@ -868,11 +881,17 @@ def resolve(client, F, obs, info, KEYS, col_diff, examples, by_msg, by_msg_bad, 
                 print("DEBUG no model call", name, "selected", d["selected"], "n", n, "ncards", len(inp.action_msg.data.cards),
                       [(pr.prob, pr.response) for pr in preds])
             return "desync"
+        bad_now = False
         if min(n, 24) != int(info["num_options"][0]):
             col_diff[("info", "num_options")] += 1
-            bad = True
+            bad = bad_now = True
+        xa = {k: np.asarray(x[k]) for k in KEYS}
+        xb = {k: obs[k][0] for k in KEYS}
+        if client.canonical_deck:
+            xa["cards_"], xa["actions_"] = canon_own_deck(xa["cards_"], xa["actions_"])
+            xb["cards_"], xb["actions_"] = canon_own_deck(xb["cards_"], xb["actions_"])
         for k in KEYS:
-            a, b = np.asarray(x[k]), obs[k][0]
+            a, b = xa[k], xb[k]
             diff = a != b
             if diff.any():
                 cols = np.nonzero(diff.reshape(-1, diff.shape[-1]).any(0))[0] if diff.ndim > 1 else np.nonzero(diff)[0]
@@ -885,8 +904,13 @@ def resolve(client, F, obs, info, KEYS, col_diff, examples, by_msg, by_msg_bad, 
                                                      ygoinf=(a[:, c] if diff.ndim > 1 else a)[rows[:6]].tolist() if rows else int(a[c]),
                                                      env=(b[:, c] if diff.ndim > 1 else b)[rows[:6]].tolist() if rows else int(b[c])))
                 bad = True
+                if k != "h_actions_":
+                    bad_now = True
         if bad:
             by_msg_bad[name] += 1
+            client.stats["decisions_with_a_difference"] += 1
+            if bad_now:
+                client.stats["decisions_with_a_difference_outside_the_history"] += 1
             if os.environ.get("PARITY_DEBUG") and client.stats["debug_prints"] < int(os.environ.get("PARITY_DEBUG")):
                 client.stats["debug_prints"] += 1
                 print("DEBUG mismatch", name, "selected", d["selected"], "nopt", int(info["num_options"][0]), "n", n)
@@ -907,6 +931,35 @@ def resolve(client, F, obs, info, KEYS, col_diff, examples, by_msg, by_msg_bad, 
         if advance(client, d, inp, preds, j):
             client.cur = None
         return "compared"
+
+
+def canon_own_deck(cards, actions):
+    """Own-deck rows in one canonical order, for both sides of the comparison.
+
+    The own-deck rows are the rows of cards_ with column 2 == 1 (deck) and
+    column 4 == 0 (own). They are sorted by their bytes, whole rows. actions_
+    column 0 (1 + row of the action's card) moves with the row. Rows with equal
+    bytes are interchangeable for the model, so an action that points at one of
+    them is mapped to the first of them. The model has no positional encoding
+    on the card rows (docs/OBS_V2.md, issue A), so two inputs that are equal
+    after this step give the same output."""
+    import numpy as np
+    idx = np.nonzero((cards[:, 2] == 1) & (cards[:, 4] == 0))[0]
+    if len(idx) == 0:
+        return cards, actions
+    cards, actions = cards.copy(), actions.copy()
+    rows = cards[idx]
+    keys = [r.tobytes() for r in rows]
+    order = sorted(range(len(idx)), key=lambda i: keys[i])
+    cards[idx] = rows[order]
+    first, remap = {}, {}
+    for new_i, old_i in enumerate(order):
+        first.setdefault(keys[old_i], int(idx[new_i]) + 1)
+        remap[int(idx[old_i]) + 1] = first[keys[old_i]]
+    for r in range(actions.shape[0]):
+        if actions[r, 3] != 0 and int(actions[r, 0]) in remap:
+            actions[r, 0] = remap[int(actions[r, 0])]
+    return cards, actions
 
 
 def advance(client, d, inp, preds, j):
