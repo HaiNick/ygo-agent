@@ -1998,6 +1998,9 @@ protected:
   byte data_[SIZE_MESSAGE_BUFFER];  // the core's own limit (was 4096)
   int dp_ = 0;
   int dl_ = 0;
+  // End of the message being handled when every message is processed
+  // (process_all_messages), else -1.
+  int msg_end_ = -1;
 
   // query_field_card has no size limit: about 60 bytes per card plus overlay
   // and counter lists. 4096 overflowed at 69 cards in one location.
@@ -2130,6 +2133,16 @@ public:
 
   // true if this seat gets observation version 2
   bool obs_v2(PlayerId player) const { return obs_version_[player & 1] >= 2; }
+
+  // Version 1 drops the rest of a core buffer after a message whose handler
+  // skips its payload (C12). With a version 2 seat in the duel every message
+  // is processed (docs/OBS_V2.md, F1). This is per duel, not per seat: the
+  // tracking that messages feed (LP, turn, phase, seen codes) is shared.
+  bool process_all_messages() const { return obs_v2(0) || obs_v2(1); }
+
+  // A handler that doesn't read its payload: go to the end of this message
+  // (process_all_messages) or, as before, to the end of the buffer.
+  void skip_msg() { dp_ = msg_end_ >= 0 ? msg_end_ : dl_; }
 
   int max_cards() const { return spec_.config["max_cards"_]; }
 
@@ -4158,7 +4171,160 @@ private:
     return out;
   }
 
+  // Payload length of message msg at data_[p] (the byte after the message
+  // id), or -1 if it is unknown or runs past the buffer. Port of the table in
+  // tests/yrp_verify.cpp and tools/ygoinf_parity.py (msg_len), which follows
+  // the reference client's ReplayAnalyze. Left out: messages that core 0.0.3
+  // doesn't define (REFRESH_DECK, CARD_SELECTED, UNEQUIP) and the two the env
+  // has no handler for anyway (TAG_SWAP, RELOAD_FIELD).
+  int msg_payload_len(int msg, int p) const {
+    bool ok = true;
+    auto u8 = [&](int o) -> int {
+      if (p + o >= dl_) {
+        ok = false;
+        return 0;
+      }
+      return data_[p + o];
+    };
+    int len = -1;
+    switch (msg) {
+    case MSG_RETRY: len = 0; break;
+    case MSG_HINT: len = 6; break;
+    case MSG_WIN: len = 2; break;
+    case MSG_SELECT_EFFECTYN: len = 13; break;
+    case MSG_SELECT_YESNO: len = 5; break;
+    case MSG_SELECT_PLACE:
+    case MSG_SELECT_DISFIELD:
+    case MSG_SELECT_POSITION: len = 6; break;
+    case MSG_SHUFFLE_DECK:
+    case MSG_SWAP_GRAVE_DECK: len = 1; break;
+    case MSG_REVERSE_DECK: len = 0; break;
+    case MSG_DECK_TOP: len = 6; break;
+    case MSG_NEW_TURN: len = 1; break;
+    case MSG_NEW_PHASE: len = 2; break;
+    case MSG_MOVE: len = 16; break;
+    case MSG_POS_CHANGE: len = 9; break;
+    case MSG_SET: len = 8; break;
+    case MSG_SWAP: len = 16; break;
+    case MSG_FIELD_DISABLED: len = 4; break;
+    case MSG_SUMMONING:
+    case MSG_SPSUMMONING:
+    case MSG_FLIPSUMMONING: len = 8; break;
+    case MSG_SUMMONED:
+    case MSG_SPSUMMONED:
+    case MSG_FLIPSUMMONED: len = 0; break;
+    case MSG_CHAINING: len = 16; break;
+    case MSG_CHAINED:
+    case MSG_CHAIN_SOLVING:
+    case MSG_CHAIN_SOLVED:
+    case MSG_CHAIN_NEGATED:
+    case MSG_CHAIN_DISABLED: len = 1; break;
+    case MSG_CHAIN_END: len = 0; break;
+    case MSG_DAMAGE:
+    case MSG_RECOVER:
+    case MSG_LPUPDATE:
+    case MSG_PAY_LPCOST: len = 5; break;
+    case MSG_EQUIP: len = 8; break;
+    case MSG_CARD_TARGET:
+    case MSG_CANCEL_TARGET: len = 8; break;
+    case MSG_ADD_COUNTER:
+    case MSG_REMOVE_COUNTER: len = 7; break;
+    case MSG_ATTACK: len = 8; break;
+    case MSG_BATTLE: len = 26; break;
+    case MSG_ATTACK_DISABLED:
+    case MSG_DAMAGE_STEP_START:
+    case MSG_DAMAGE_STEP_END: len = 0; break;
+    case MSG_MISSED_EFFECT: len = 8; break;
+    case MSG_ROCK_PAPER_SCISSORS:
+    case MSG_HAND_RES: len = 1; break;
+    case MSG_ANNOUNCE_RACE:
+    case MSG_ANNOUNCE_ATTRIB: len = 6; break;
+    case MSG_CARD_HINT: len = 9; break;
+    case MSG_PLAYER_HINT: len = 6; break;
+    case MSG_MATCH_KILL: len = 4; break;
+    case MSG_SELECT_BATTLECMD: {
+      int o = 2 + u8(1) * 11;
+      len = o + 1 + u8(o) * 8 + 2;
+      break;
+    }
+    case MSG_SELECT_IDLECMD: {
+      int o = 1;
+      for (int i = 0; i < 5; ++i) {
+        o += 1 + u8(o) * 7;
+      }
+      len = o + 1 + u8(o) * 11 + 3;
+      break;
+    }
+    case MSG_SELECT_OPTION: len = 2 + u8(1) * 4; break;
+    case MSG_SELECT_CARD:
+    case MSG_SELECT_TRIBUTE: len = 5 + u8(4) * 8; break;
+    case MSG_SELECT_UNSELECT_CARD: {
+      int o = 6 + u8(5) * 8;
+      len = o + 1 + u8(o) * 8;
+      break;
+    }
+    case MSG_SELECT_CHAIN: len = 11 + u8(1) * 14; break;
+    case MSG_SELECT_COUNTER: len = 6 + u8(5) * 9; break;
+    case MSG_SELECT_SUM: {
+      int o = 8 + u8(8) * 11 + 1;
+      len = o + 1 + u8(o) * 11;
+      break;
+    }
+    case MSG_SORT_CARD:
+    case MSG_CONFIRM_DECKTOP:
+    case MSG_CONFIRM_EXTRATOP: len = 2 + u8(1) * 7; break;
+    case MSG_CONFIRM_CARDS: len = 3 + u8(2) * 7; break;
+    case MSG_SHUFFLE_HAND:
+    case MSG_SHUFFLE_EXTRA: len = 2 + u8(1) * 4; break;
+    case MSG_SHUFFLE_SET_CARD: len = 2 + u8(1) * 8; break;
+    case MSG_RANDOM_SELECTED: len = 2 + u8(1) * 4; break;
+    case MSG_BECOME_TARGET: len = 1 + u8(0) * 4; break;
+    case MSG_DRAW: len = 2 + u8(1) * 4; break;
+    case MSG_TOSS_COIN:
+    case MSG_TOSS_DICE: len = 2 + u8(1); break;
+    case MSG_ANNOUNCE_CARD:
+    case MSG_ANNOUNCE_NUMBER: len = 2 + u8(1) * 4; break;
+    case MSG_AI_NAME:
+    case MSG_SHOW_HINT: len = 2 + (u8(0) | (u8(1) << 8)) + 1; break;
+    default: len = -1; break;
+    }
+    if (!ok || len < 0 || p + len > dl_) {
+      return -1;
+    }
+    return len;
+  }
+
   void handle_message() {
+    msg_end_ = -1;
+    if (process_all_messages()) {
+      int msg = data_[dp_];
+      int len = msg_payload_len(msg, dp_ + 1);
+      if (len < 0) {
+        show_buffer();
+        throw std::runtime_error(fmt::format(
+            "[handle_message] no length for message {} at {} of {} bytes",
+            msg_to_string(msg), dp_, dl_));
+      }
+      msg_end_ = dp_ + 1 + len;
+    }
+    handle_message_();
+    if (msg_end_ >= 0) {
+      // Every handler either reads its payload or calls skip_msg(). A
+      // position past the end, or (outside verbose mode, where some handlers
+      // print without reading everything) before it, means the length table
+      // and the handler disagree. Stop instead of parsing garbage.
+      if (dp_ > msg_end_ || (dp_ < msg_end_ && !verbose_)) {
+        show_buffer();
+        throw std::runtime_error(fmt::format(
+            "[handle_message] message {} ends at {}, the handler stopped at {}",
+            msg_to_string(msg_), msg_end_, dp_));
+      }
+      dp_ = msg_end_;
+      msg_end_ = -1;
+    }
+  }
+
+  void handle_message_() {
     msg_ = int(data_[dp_++]);
     legal_actions_ = {};
     confirmed_spec_codes_.clear();  // hints belong to one decision
@@ -4171,7 +4337,7 @@ private:
 
     if (msg_ == MSG_DRAW) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4212,7 +4378,7 @@ private:
       }
     } else if (msg_ == MSG_MOVE) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4335,7 +4501,7 @@ private:
       }
     } else if (msg_ == MSG_SWAP) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code1 = read_u32();
@@ -4359,7 +4525,7 @@ private:
       }
     } else if (msg_ == MSG_SET) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4376,7 +4542,7 @@ private:
                               card.get_position()));
     } else if (msg_ == MSG_EQUIP) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto c = read_u8();
@@ -4421,7 +4587,7 @@ private:
       }
     } else if (msg_ == MSG_CARD_HINT) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       uint8_t player = read_u8();
@@ -4457,7 +4623,7 @@ private:
       }
     } else if (msg_ == MSG_POS_CHANGE) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4478,7 +4644,7 @@ private:
                  ") changed from " + prevpos_str + " to " + pos_str + ".");
     } else if (msg_ == MSG_BECOME_TARGET) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto u = read_u8();
@@ -4498,7 +4664,7 @@ private:
       }
     } else if (msg_ == MSG_CONFIRM_DECKTOP) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4526,7 +4692,7 @@ private:
       }
     } else if (msg_ == MSG_RANDOM_SELECTED) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4562,14 +4728,14 @@ private:
       }
     } else if (msg_ == MSG_PLAYER_HINT) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       dp_ += 6;
       // TODO(3): implement output
     } else if (msg_ == MSG_CARD_TARGET) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto c1 = read_u8();
@@ -4625,7 +4791,7 @@ private:
       }
     } else if (msg_ == MSG_MISSED_EFFECT) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       dp_ += 4;
@@ -4641,7 +4807,7 @@ private:
     } else if (msg_ == MSG_SORT_CARD) {
       // TODO(3): implement action
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         resp_buf_[0] = 255;
         YGO_SetResponseb(pduel_, resp_buf_);
         return;
@@ -4700,7 +4866,7 @@ private:
       // };
     } else if (msg_ == MSG_ADD_COUNTER) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto ctype = read_u16();
@@ -4717,7 +4883,7 @@ private:
       op->notify(fmt::format("{} counter(s) of type {} placed on {} ().", count, "UNK", c.name_, c.get_spec(op_id)));
     } else if (msg_ == MSG_REMOVE_COUNTER) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto ctype = read_u16();
@@ -4733,7 +4899,7 @@ private:
       op->notify(fmt::format("{} counter(s) of type {} removed from {} ().", count, "UNK", c.name_, c.get_spec(op_id)));
     } else if (msg_ == MSG_ATTACK_DISABLED) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       for (PlayerId pl = 0; pl < 2; pl++) {
@@ -4741,14 +4907,14 @@ private:
       }
     } else if (msg_ == MSG_SHUFFLE_SET_CARD) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       // TODO(3): implement output
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_SHUFFLE_DECK) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4758,7 +4924,7 @@ private:
       op->notify(pl->nickname_ + " shuffled their deck.");
     } else if (msg_ == MSG_SHUFFLE_EXTRA) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4772,22 +4938,22 @@ private:
       op->notify(fmt::format("{} shuffled their extra deck ({}).", pl->nickname_, count));
     } else if (msg_ == MSG_SHUFFLE_HAND) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
 
       auto player = read_u8();
-      dp_ = dl_;
+      skip_msg();
 
       auto& pl = players_[player];
       auto& op = players_[1 - player];
       pl->notify("You shuffled your hand.");
       op->notify(pl->nickname_ + " shuffled their hand.");
     } else if (msg_ == MSG_SUMMONED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_SUMMONING) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4801,12 +4967,12 @@ private:
                    card.get_position() + " position.");
       }
     } else if (msg_ == MSG_SPSUMMONED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_FLIPSUMMONED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_FLIPSUMMONING) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
 
@@ -4823,7 +4989,7 @@ private:
       }
     } else if (msg_ == MSG_SPSUMMONING) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4845,11 +5011,11 @@ private:
         }
       }
     } else if (msg_ == MSG_CHAIN_NEGATED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAIN_DISABLED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAIN_SOLVED) {
-      dp_ = dl_;
+      skip_msg();
       revealed_.clear();
       confirmed_locs_.clear();
       for (auto &v : views_) {
@@ -4857,14 +5023,14 @@ private:
         v.confirmed_locs.clear();
       }
     } else if (msg_ == MSG_CHAIN_SOLVING) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAINED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAIN_END) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAINING) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4913,7 +5079,7 @@ private:
           pl->nickname_ + "'s LP is now " + std::to_string(lp_[player]) + ".");
     } else if (msg_ == MSG_ATTACK) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto attacker = read_u32();
@@ -4969,7 +5135,7 @@ private:
       }
     } else if (msg_ == MSG_BATTLE) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto attacker = read_u32();
@@ -5039,7 +5205,7 @@ private:
       // Display-only messages that need no answer. They used to fall through
       // to "Unknown message" and abort the process; skip them like the other
       // display-only messages above.
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_RETRY) {
       throw std::runtime_error("Retry");
     } else if (msg_ == MSG_SELECT_BATTLECMD) {
