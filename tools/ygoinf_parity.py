@@ -715,7 +715,7 @@ FEATURES = {
 
 
 # ---------------------------------------------------------------- driver
-def make_envs(deck_dir, deck1, deck2, seed, with_ref):
+def make_envs(deck_dir, deck1, deck2, seed, with_ref, obs_version=1):
     os.chdir(ROOT / "scripts")
     sys.path.insert(0, str(ROOT / "tests"))
     import numpy as np  # noqa: F401
@@ -728,6 +728,8 @@ def make_envs(deck_dir, deck1, deck2, seed, with_ref):
     cfg = dict(num_envs=1, num_threads=1, seed=seed, deck1=deck1, deck2=deck2, max_options=24,
                n_history_actions=32, play_mode="self", async_reset=False, greedy_reward=False,
                timeout=600, oppo_info=False)
+    if obs_version != 1:
+        cfg["obs_version"] = obs_version
     P.init_module(db, "code_list.txt", decks)
     Spec, _, _, Gymnasium = py_env(P._YGOProEnvSpec, P._YGOProEnvPool)
     penv = Gymnasium(Spec(Spec.gen_config(gym_reset_return_info=True, **cfg)))
