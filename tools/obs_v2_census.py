@@ -15,6 +15,7 @@ except the C12 counts (see there).
   C9   opponent deck/hand/extra rows whose features the env exposes although this seat never
        got a confirmation for them ("leak"), and cards this seat was shown that the env hides
        ("miss"). Windows are the env's: a confirmation counts until the next MSG_CHAIN_SOLVED.
+       Face-up cards in the opponent's extra deck and hand (public cards) are not a leak.
   C10  decisions whose message has more than 24 options (idle, battle, select card, unselect
        card, tribute, chain), and idle/battle commands that lose their phase change that way.
   C11  decisions with a card that has counters (feature 15), with the real counts.
@@ -365,7 +366,9 @@ def census(obs, info):
                 if not exposed[r] or j >= len(cs):
                     continue
                 c = cs[j]
-                public = loc == yp.LOCATION_EXTRA and (c.pos & yp.POS_FACEUP)
+                # a face-up card in the extra deck, or a hand card the core keeps face-up
+                # (EFFECT_PUBLIC), is public
+                public = loc in (yp.LOCATION_EXTRA, yp.LOCATION_HAND) and (c.pos & yp.POS_FACEUP)
                 if public or known.get((c.con, c.loc, c.seq)) == c.code:
                     tot[f"C9_exposed_ok_rows_{LOCID[locid]}"] += 1
                 else:

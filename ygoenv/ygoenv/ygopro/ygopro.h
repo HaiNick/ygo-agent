@@ -2027,6 +2027,21 @@ protected:
   std::unordered_map<uint32_t, std::vector<CardCode>> confirmed_locs_;
   // current selection: spec -> code for confirmed cards the observation has no slot for
   std::unordered_map<std::string, CardCode> confirmed_spec_codes_;
+  // Version 2 (docs/OBS_V2.md, C1): what each seat was shown. Version 1 keeps
+  // one set for both seats (revealed_, seen_codes_, confirmed_locs_), filled
+  // whoever sees the cards. A ygopro server sends MSG_CONFIRM_CARDS for deck
+  // cards only to the player in its first byte, and every other confirmation
+  // to both players. SeatView follows that rule (seat_receives_confirm).
+  struct SeatView {
+    // cards shown to this seat since the last MSG_CHAIN_SOLVED:
+    // (controller << 16 | location << 8 | sequence) -> code
+    std::unordered_map<uint32_t, CardCode> known;
+    // seen_codes_ as this seat knows them
+    std::vector<CardCode> seen[2];
+    // confirmed_locs_ as this seat knows them
+    std::unordered_map<uint32_t, std::vector<CardCode>> confirmed_locs;
+  };
+  SeatView views_[2];
   // Version 2, current decision: spec -> code for action cards in the deciding
   // player's own deck. In card selections the core numbers such candidates
   // 0, 1, 2, ... (card::get_select_sequence) instead of giving their sequence,
@@ -2188,6 +2203,12 @@ public:
     confirmed_locs_.clear();
     confirmed_spec_codes_.clear();
     deck_spec_codes_.clear();
+    for (auto &v : views_) {
+      v.known.clear();
+      v.seen[0].clear();
+      v.seen[1].clear();
+      v.confirmed_locs.clear();
+    }
 
     history_actions_1_.Zero();
     history_actions_2_.Zero();
@@ -2718,7 +2739,9 @@ public:
       spec_infos = spec_infos_;
       loc_n_cards = loc_n_cards_;
     } else {
-      auto [spec_infos_, loc_n_cards_] = _set_obs_cards(state["obs:cards_"_], to_play_);
+      auto [spec_infos_, loc_n_cards_] = obs_v2(to_play_)
+          ? _set_obs_cards_v2(state["obs:cards_"_], to_play_)
+          : _set_obs_cards(state["obs:cards_"_], to_play_);
       spec_infos = spec_infos_;
       loc_n_cards = loc_n_cards_;
     }
@@ -2875,12 +2898,6 @@ private:
                 hide = false;
               }
             }
-            if (obs_v2(to_play) && (c.location_ & LOCATION_OVERLAY)) {
-              // An xyz material is public. Its position_ holds the overlay
-              // index, so the face-down test above is meaningless for it
-              // (version 1 keeps that: no id for such a material's spec).
-              hide = false;
-            }
             CardId card_id = 0;
             if (!hide) {
               card_id = c_get_card_id(c.code_);
@@ -2889,14 +2906,101 @@ private:
             // tokens can exceed that; writing on would run into the next
             // env's slice of the batch.
             if (offset >= max_rows) break;
-            // Version 1 never wrote the card id into the card rows (K1): the
-            // model saw id 0 for every card. Version 2 writes it for every
-            // row whose features are written (docs/OBS_V2.md, B1).
-            _set_obs_card_(f_cards, offset, c, hide, obs_v2(to_play) ? card_id : 0);
+            _set_obs_card_(f_cards, offset, c, hide);
             offset++;
 
             spec_infos[spec] = {static_cast<uint16_t>(offset), card_id};
           }
+        }
+      }
+    }
+    return {spec_infos, loc_n_cards};
+  }
+
+  // Version 2: is this card of viewer's opponent visible to viewer?
+  // - an xyz material: yes (its position_ holds the overlay index)
+  // - a card this seat was shown since the last MSG_CHAIN_SOLVED, still in
+  //   that place with that code: yes
+  // - in the deck: otherwise no
+  // - anywhere else: if it isn't face-down. That includes face-up cards in
+  //   the extra deck and public cards in the hand.
+  bool opp_card_visible_v2(PlayerId viewer, const Card &c) const {
+    if (c.location_ & LOCATION_OVERLAY) {
+      return true;
+    }
+    const auto &known = views_[viewer].known;
+    auto it = known.find((static_cast<uint32_t>(c.controler_) << 16) |
+                         ((c.location_ & 0xff) << 8) | (c.sequence_ & 0xff));
+    if (it != known.end() && it->second == c.code_) {
+      return true;
+    }
+    if (c.location_ == LOCATION_DECK) {
+      return false;
+    }
+    return !(c.position_ & POS_FACEDOWN);
+  }
+
+  bool seat_knows_card_in(PlayerId viewer, PlayerId controller, uint8_t location) const {
+    for (const auto &kv : views_[viewer].known) {
+      if ((kv.first >> 16) == controller && ((kv.first >> 8) & 0xff) == location) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Observation version 2 of _set_obs_cards (docs/OBS_V2.md, B1 and C1).
+  // - Every row whose features are written also gets its card id in columns
+  //   0 and 1. Version 1 wrote id 0 everywhere (K1).
+  // - An opponent card has features if this seat can see it
+  //   (opp_card_visible_v2). Version 1 unhid the opponent's whole deck, hand
+  //   and extra deck while revealed_ was non-empty, whoever had been shown a
+  //   card, and tested the confirmed card with an inverted prefix.
+  // - An opponent card in the deck, hand or extra deck that this seat can't
+  //   see is a count-only row (location and owner), with no spec. Version 1
+  //   wrote such a row face-down while revealed_ was non-empty.
+  std::tuple<SpecInfos, std::vector<int>> _set_obs_cards_v2(TArray<uint8_t> &f_cards, PlayerId to_play) {
+    const int max_rows = max_cards() * 2;
+    SpecInfos spec_infos;
+    std::vector<int> loc_n_cards;
+    int offset = 0;
+    for (auto pi = 0; pi < 2; pi++) {
+      const PlayerId player = (to_play + pi) % 2;
+      const bool opponent = pi == 1;
+      for (uint8_t location : {LOCATION_DECK, LOCATION_HAND, LOCATION_MZONE, LOCATION_SZONE,
+                               LOCATION_GRAVE, LOCATION_REMOVED, LOCATION_EXTRA}) {
+        const bool hidden_zone = location == LOCATION_DECK || location == LOCATION_HAND ||
+                                 location == LOCATION_EXTRA;
+        // The opponent's deck is only queried when this seat was shown a
+        // card in it. Hand and extra deck can hold face-up cards.
+        if (opponent && location == LOCATION_DECK && !seat_knows_card_in(to_play, player, location)) {
+          auto n_cards = YGO_QueryFieldCount(pduel_, player, location);
+          loc_n_cards.push_back(n_cards);
+          for (auto i = 0; i < n_cards; i++) {
+            if (offset >= max_rows) break;
+            f_cards(offset, 2) = location_to_id(location);
+            f_cards(offset, 4) = 1;
+            offset++;
+          }
+          continue;
+        }
+        std::vector<Card> cards = get_cards_in_location(player, location);
+        int n_cards = cards.size();
+        loc_n_cards.push_back(n_cards);
+        for (int i = 0; i < n_cards; ++i) {
+          const auto &c = cards[i];
+          const bool hide = opponent && !opp_card_visible_v2(to_play, c);
+          if (offset >= max_rows) break;
+          if (hide && hidden_zone) {
+            f_cards(offset, 2) = location_to_id(location);
+            f_cards(offset, 4) = 1;
+            offset++;
+            continue;
+          }
+          CardId card_id = hide ? 0 : c_get_card_id(c.code_);
+          _set_obs_card_(f_cards, offset, c, hide, card_id);
+          offset++;
+          spec_infos[c.get_spec(opponent)] = {static_cast<uint16_t>(offset), card_id};
         }
       }
     }
@@ -3251,6 +3355,17 @@ private:
       offset++;
     }
     auto [loc, seq, pos] = spec_to_ls(spec.substr(offset));
+    if (opponent && obs_v2(1 - player)) {
+      // version 2: 0 for a card the observation shows as a count only
+      if (loc == LOCATION_DECK || loc == LOCATION_HAND || loc == LOCATION_EXTRA) {
+        Card c = get_card(player, loc, seq);
+        c.controler_ = player;
+        if (!opp_card_visible_v2(1 - player, c)) {
+          return 0;
+        }
+      }
+      return c_get_card_id(get_card_code(player, loc, seq));
+    }
     if (opponent) {
       bool hidden_for_opponent = true;
       if (
@@ -3826,11 +3941,7 @@ private:
   // 1. read msg_ from data_ and update dp_
   // 2. (optional) print information if verbose_ is true
   // 3. update to_play_ and options_ if need action
-  void note_seen(uint32_t player, CardCode code) {
-    if (player > 1 || code == 0) {
-      return;
-    }
-    auto &v = seen_codes_[player];
+  static void note_seen_in(std::vector<CardCode> &v, CardCode code) {
     auto it = std::find(v.begin(), v.end(), code);
     if (it != v.end()) {
       v.erase(it);
@@ -3838,16 +3949,28 @@ private:
     v.push_back(code);
   }
 
+  // a code made public to both players
+  void note_seen(uint32_t player, CardCode code) {
+    if (player > 1 || code == 0) {
+      return;
+    }
+    note_seen_in(seen_codes_[player], code);
+    note_seen_in(views_[0].seen[player], code);
+    note_seen_in(views_[1].seen[player], code);
+  }
+
   // Opponent deck cards are not part of the card observation; if a selection
   // offers one that was confirmed this chain, remember its code for the action.
-  void note_confirmed_spec(uint32_t c, uint32_t loc, uint32_t seq,
+  void note_confirmed_spec(PlayerId player, uint32_t c, uint32_t loc, uint32_t seq,
                            const std::string &spec, CardCode code) {
     if (loc != LOCATION_DECK && loc != LOCATION_EXTRA) {
       return;
     }
     (void)seq;
-    auto it = confirmed_locs_.find((c << 8) | loc);
-    if (it != confirmed_locs_.end() &&
+    // version 2: only what was confirmed to the selecting player
+    const auto &locs = obs_v2(player) ? views_[player].confirmed_locs : confirmed_locs_;
+    auto it = locs.find((c << 8) | loc);
+    if (it != locs.end() &&
         std::find(it->second.begin(), it->second.end(), code) != it->second.end()) {
       confirmed_spec_codes_[spec] = code;
     }
@@ -3906,11 +4029,33 @@ private:
       if (!avail(off + 1)) break;
       int n = data_[dp_ + off];
       off += 1;
+      // A ygopro server sends a MSG_CONFIRM_CARDS whose first card is in the
+      // deck only to the player in byte 0. Everything else goes to both.
+      bool receives[2] = {true, true};
+      if (msg_ == MSG_CONFIRM_CARDS && n > 0 && avail(off + 7) &&
+          data_[dp_ + off + 5] == LOCATION_DECK) {
+        uint32_t viewer = data_[dp_];
+        receives[0] = viewer == 0;
+        receives[1] = viewer == 1;
+      }
       for (int i = 0; i < n && avail(off + 7); ++i, off += 7) {
         uint32_t c = data_[dp_ + off + 4], l = data_[dp_ + off + 5], q = data_[dp_ + off + 6];
-        note_seen(c, peek_u32(off));
-        (void)q;
-        confirmed_locs_[(c << 8) | l].push_back(peek_u32(off));
+        CardCode code = peek_u32(off);
+        if (c <= 1 && code != 0) {
+          note_seen_in(seen_codes_[c], code);
+        }
+        confirmed_locs_[(c << 8) | l].push_back(code);
+        for (int seat = 0; seat < 2; ++seat) {
+          if (!receives[seat]) {
+            continue;
+          }
+          auto &v = views_[seat];
+          if (c <= 1 && code != 0) {
+            note_seen_in(v.seen[c], code);
+          }
+          v.confirmed_locs[(c << 8) | l].push_back(code);
+          v.known[(c << 16) | (l << 8) | q] = code;
+        }
       }
       break;
     }
@@ -3950,11 +4095,14 @@ private:
         try_add(opcodes[i - 1]);
       }
     }
-    const auto &oppo_seen = seen_codes_[1 - player];
+    // version 2: the codes this player has seen (not the other seat's
+    // private looks at its deck)
+    const auto *seen = obs_v2(player) ? views_[player].seen : seen_codes_;
+    const auto &oppo_seen = seen[1 - player];
     for (auto it = oppo_seen.rbegin(); it != oppo_seen.rend(); ++it) {
       try_add(*it);
     }
-    const auto &own_seen = seen_codes_[player];
+    const auto &own_seen = seen[player];
     for (auto it = own_seen.rbegin(); it != own_seen.rend(); ++it) {
       try_add(*it);
     }
@@ -4683,6 +4831,10 @@ private:
       dp_ = dl_;
       revealed_.clear();
       confirmed_locs_.clear();
+      for (auto &v : views_) {
+        v.known.clear();
+        v.confirmed_locs.clear();
+      }
     } else if (msg_ == MSG_CHAIN_SOLVING) {
       dp_ = dl_;
     } else if (msg_ == MSG_CHAINED) {
@@ -5053,7 +5205,7 @@ private:
         for (const auto &card : cards) {
           auto spec = card.get_spec(player);
           specs.push_back(spec);
-          note_confirmed_spec(card.controler_, card.location_, card.sequence_, spec, card.code_);
+          note_confirmed_spec(player, card.controler_, card.location_, card.sequence_, spec, card.code_);
           note_own_deck_spec(player, card.controler_, card.location_, spec, card.code_);
           int i = specs.size();
           if (card.controler_ != player && card.position_ & POS_FACEDOWN) {
@@ -5073,7 +5225,7 @@ private:
           auto pos = read_u8();
           auto spec = ls_to_spec(loc, seq, pos, controller != player);
           specs.push_back(spec);
-          note_confirmed_spec(controller, loc, seq, spec, code);
+          note_confirmed_spec(player, controller, loc, seq, spec, code);
           note_own_deck_spec(player, controller, loc, spec, code);
         }
       }
