@@ -496,11 +496,13 @@ def float_transform(x):
 def encode_card(card: Card):
     x = np.zeros(N_CARD_FEATURES, dtype=np.uint8)
 
-    # Columns 0-1 (card id) stay 0: the env never writes the card id into the
-    # card list (ygopro.h _set_obs_cards calls _set_obs_card_ without it), so
-    # the model was trained with id 0 for every card here. Card identity
-    # reaches the model through the action and history ids only.
-    get_code_id(card.code)  # still reject unknown codes
+    # Version 1: columns 0-1 (card id) stay 0. The env never wrote the card id
+    # into the card list (ygopro.h _set_obs_cards calls _set_obs_card_ without
+    # it), so those models were trained with id 0 for every card here.
+    # Version 2 writes the id (B1). A card the client can't see has code 0.
+    card_id = get_code_id(card.code)  # also rejects unknown codes
+    if OBS_VERSION >= 2:
+        x[0:2] = int_transform(card_id)
 
     x[2] = location_to_id[card.location]
     if card.location in [Location.mzone, Location.szone, Location.grave]:
@@ -523,9 +525,13 @@ def encode_card(card: Card):
     x[7] = attribute_to_id[card.attribute]
     x[8] = race_to_id[card.race]
     x[9] = min(max(card.level, 0), 13)
-    # The env stores the raw counter word (type | count << 16) clamped to 15,
-    # so training only ever saw 0 (no counters) or 15.
-    x[10] = 15 if card.counter > 0 else 0
+    # Version 1: the env stores the raw counter word (type | count << 16)
+    # clamped to 15, so training only ever saw 0 (no counters) or 15.
+    # Version 2: the count, clamped to 15 (E1).
+    if OBS_VERSION >= 2:
+        x[10] = min(max(card.counter, 0), 15)
+    else:
+        x[10] = 15 if card.counter > 0 else 0
     x[11] = negated_to_id[card.negated]
 
     x[12:14] = float_transform(card.attack)
@@ -1271,9 +1277,30 @@ def auto_card_id(action: LegalAction, spec_infos):
 
 
 def is_random_discard(input: Input):
+    # Version 2: the model chooses End Phase discards (G1).
     data = input.action_msg.data
-    return (data.msg_type == "select_card" and getattr(data, "select_hint", 0) == 501
+    return (OBS_VERSION < 2 and data.msg_type == "select_card" and getattr(data, "select_hint", 0) == 501
             and input.global_.phase == Phase.end)
+
+
+def encoded_positions(legal_actions, msg_type):
+    """Positions in legal_actions of the actions the model sees, in the order of the encoded
+    rows. At most MAX_ACTIONS. Version 1: the first ones. Version 2 (D1): an idle or battle
+    command with more actions keeps its phase changes (the last entries) and cuts in front
+    of them, like the env (ygopro.h WriteState)."""
+    n = len(legal_actions)
+    if n <= MAX_ACTIONS:
+        return list(range(n))
+    if OBS_VERSION >= 2 and msg_type in ("select_idlecmd", "select_battlecmd"):
+        phases = [i for i, a in enumerate(legal_actions) if a.phase != ActionPhase.none]
+        if phases:
+            rest = [i for i in range(n) if a_is_not_phase(legal_actions[i])]
+            return rest[:MAX_ACTIONS - len(phases)] + phases
+    return list(range(MAX_ACTIONS))
+
+
+def a_is_not_phase(action):
+    return action.phase == ActionPhase.none
 
 
 def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
@@ -1286,7 +1313,8 @@ def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
     cards, spec_infos = encode_cards(input.cards)
     global_ = encode_global(input.global_, input.cards)
     preset_ids = [0 if a.hint else a.card_id for a in legal_actions]
-    actions = encode_legal_actions(legal_actions, spec_infos)
+    enc = encoded_positions(legal_actions, input.action_msg.data.msg_type)
+    actions = encode_legal_actions([legal_actions[i] for i in enc], spec_infos)
     h_actions = state.history_actions.encode(input.global_.turn)
     model_input = {
         "cards_": cards,
@@ -1323,7 +1351,11 @@ def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
         state.last_model = True
         rstate, probs, value = model_fn(state.rstate, model_input)
         state.rstate = rstate
-        probs = revert_pad_truncate(probs, n_actions)
+        # one probability per legal action, -1 for the ones the model didn't see
+        model_probs = probs
+        probs = [-1] * n_actions
+        for k, i in enumerate(enc):
+            probs[i] = model_probs[k] if k < len(model_probs) else -1
         assert len(probs) == n_actions
         probs, responses, can_finish = add_skipped_back(probs, legal_actions, input.action_msg)
         win_rate = (value + 1) / 2

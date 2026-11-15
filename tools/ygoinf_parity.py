@@ -41,8 +41,19 @@ revealed_ set is non-empty (C9). The client sends such cards with code 0 and
 position none, and ygoinf then writes the same row and gives it no spec. An
 opponent face-down card elsewhere is sent with code 0 and its real position.
 
+Observation version 2 (--obs-version 2, docs/OBS_V2.md): the env tracks what each seat was
+shown and processes every message, so the reference client needs no emulation of C9 and C12.
+Each seat has its own state in every view, fed with every message it receives. The views env
+and client then differ only in the own deck: env sends it in the env's order, client sorted by
+code. A card of the opponent is sent with its code if the seat can see it (an xyz material; a
+card shown to the seat since the last MSG_CHAIN_SOLVED, still in that place; outside the deck:
+a card that isn't face-down). Otherwise it is sent as a count-only row (deck, hand, extra deck)
+or a face-down card (elsewhere). Counters are sent as the count. End Phase discards go to the
+model.
+
 usage: python tools/ygoinf_parity.py [--deck DIR] [--deck1 NAME --deck2 NAME]
-         [--games N] [--seed S] [--view env|client|client-deck] [--ygoinf DIR] [--json FILE] [--no-ref]
+         [--games N] [--seed S] [--view env|client|client-deck] [--obs-version 1|2]
+         [--ygoinf DIR] [--json FILE] [--no-ref]
 Build the recording module first: xmake b ygopro_parity (copies it to tests/).
 PARITY_DEBUG=N prints the rows of the first N decisions with a difference.
 exit code 0 = no mismatch in the env view (and the recording build is faithful).
@@ -361,16 +372,18 @@ class DuelState:
 class RefClient:
     """Builds ygoinf requests for both seats from the recorded stream."""
 
-    def __init__(self, F, Mo, view, card_data):
+    def __init__(self, F, Mo, view, card_data, obs_version=1):
         self.F, self.Mo, self.view = F, Mo, view
+        self.v2 = obs_version >= 2
+        # one state equal to the env's (version 1, env view), else one per seat
+        self.single = view == "env" and not self.v2
         self.sort_deck = view == "client"
         # Compare the own-deck rows in one canonical order (canon_own_deck).
         # The env view keeps the exact comparison: there the client is given
         # the env's deck order, so the arrays must be equal as they are.
         self.canonical_deck = view != "env"
         self.cd = card_data
-        # env view: one state equal to the env's. client view: one per seat.
-        self.states = [DuelState()] if view == "env" else [DuelState(), DuelState()]
+        self.states = [DuelState()] if self.single else [DuelState(), DuelState()]
         self.snapshot = None
         self.decks = [None, None]
         self.queue = []
@@ -382,7 +395,7 @@ class RefClient:
         self.new_duel()
 
     def st(self, seat):
-        return self.states[0] if self.view == "env" else self.states[seat]
+        return self.states[0] if self.single else self.states[seat]
 
     def new_duel(self):
         for s in self.states:
@@ -420,7 +433,7 @@ class RefClient:
         for k, (m, b) in enumerate(msgs):
             env_handles = not dropped
             for seat, s in enumerate(self.states):
-                handles = env_handles if self.view == "env" else True
+                handles = env_handles if self.single else True
                 if handles and m not in DECISIONS:
                     s.apply(m, b, (lambda mm, bb, seat=seat: self._receives(seat, mm, bb)))
             if m in DECISIONS:
@@ -428,7 +441,7 @@ class RefClient:
                     self.stats["decision_not_last_in_buffer"] += 1
                 if dropped:
                     self.stats["decision_after_dropped_message"] += 1
-                    if self.view == "env":
+                    if self.single:
                         continue
                 self.queue.append(dict(m=m, b=b, snap=None,
                                        st=[self._copy_state(s) for s in self.states]))
@@ -436,11 +449,11 @@ class RefClient:
                     # env discard_hand_: set by any 501 hint, cleared by the next select_card
                     for s in self.states:
                         s.discard_hand = False
-            if m not in ENV_EXACT and m not in DECISIONS:
+            if m not in ENV_EXACT and m not in DECISIONS and not self.v2:
                 dropped = True
 
     def _receives(self, seat, m, b):
-        if self.view == "env":
+        if self.single:
             return True
         if m == M["CONFIRM_CARDS"] and b[2] > 0 and b[3 + 5] == LOCATION_DECK:
             # the server sends deck confirmations to the viewing player only
@@ -483,6 +496,8 @@ class RefClient:
                     types=[TYPENAMES[i] for i, bit in enumerate(TYPEBITS) if cd.type & bit])
 
     def cards(self, p, st, snap):
+        if self.v2:
+            return self.cards_v2(p, st, snap)
         out = []
         for pi in range(2):
             pl = (p + pi) % 2
@@ -517,6 +532,49 @@ class RefClient:
                     if c.link & 0xFF: level = c.link & 0xFF
                     df = c.link_marker if c.link_marker > 0 else c.def_
                     counter = c.counters[0] if c.counters else 0
+                    neg = bool(c.status & (STATUS_DISABLED | STATUS_FORBIDDEN))
+                    rows.append(self._card_dict(p, c.code, c.con, c.loc, c.seq, c.pos, -1, level, c.atk, df, counter, neg))
+                if self.sort_deck and not opp and loc == LOCATION_DECK:
+                    # a client doesn't know the order of its own deck
+                    rows.sort(key=lambda r: r["code"])
+                    for i, r in enumerate(rows):
+                        r["sequence"] = i
+                out.extend(rows)
+        return out
+
+    def cards_v2(self, p, st, snap):
+        """Observation version 2: what this seat can see, no emulation."""
+        out = []
+        for pi in range(2):
+            pl = (p + pi) % 2
+            opp = pi == 1
+            for loc in LOC_ORDER:
+                rows = []
+                for c in snap[(pl, loc)]:
+                    for i, xc in enumerate(c.xyz):
+                        cd, atk, df = self._static_card(xc)
+                        rows.append(self._card_dict(p, xc, c.con, c.loc, c.seq, 0, i, cd.level, atk, df, 0, False))
+                    visible = True
+                    if opp:
+                        if st.known.get((c.con, c.loc, c.seq)) == c.code:
+                            visible = True
+                        elif loc == LOCATION_DECK:
+                            visible = False
+                        else:
+                            visible = not (c.pos & POS_FACEDOWN)
+                    if not visible:
+                        if loc in HIDDEN_FOR_OPPONENT:
+                            rows.append(self._card_dict(p, 0, pl, loc, 0, 0, -1, 0, 0, 0, 0, False, blank=True))
+                        else:
+                            rows.append(self._card_dict(p, 0, c.con, c.loc, c.seq, c.pos, -1, 0, 0, 0, 0, False, blank=True))
+                        continue
+                    cd = self.cd[c.code]
+                    level = cd.level
+                    if c.level & 0xFF: level = c.level & 0xFF
+                    if c.rank & 0xFF: level = c.rank & 0xFF
+                    if c.link & 0xFF: level = c.link & 0xFF
+                    df = c.link_marker if c.link_marker > 0 else c.def_
+                    counter = (c.counters[0] >> 16) if c.counters else 0
                     neg = bool(c.status & (STATUS_DISABLED | STATUS_FORBIDDEN))
                     rows.append(self._card_dict(p, c.code, c.con, c.loc, c.seq, c.pos, -1, level, c.atk, df, counter, neg))
                 if self.sort_deck and not opp and loc == LOCATION_DECK:
@@ -664,7 +722,7 @@ class RefClient:
     def request(self, d):
         """ygoinf Input for the current step of decision d."""
         p = self.player_of(d)
-        st = d["st"][0] if self.view == "env" else d["st"][p]
+        st = d["st"][0] if self.single else d["st"][p]
         data = self.action_msg(p, d, st)
         inp = {"global": self.global_(p, st), "cards": self.cards(p, st, d["snap"]),
                "action_msg": {"data": data}}
@@ -741,20 +799,22 @@ def make_envs(deck_dir, deck1, deck2, seed, with_ref, obs_version=1):
 
 
 def run(deck_dir="~/ygo/decks/mine", deck1="random", deck2="random", games=20, seed=0, view="env",
-        ygoinf_dir=None, with_ref=True, max_examples=5, log=print):
+        ygoinf_dir=None, with_ref=True, max_examples=5, log=print, obs_version=1):
     import numpy as np
     deck_dir = os.path.abspath(os.path.expanduser(deck_dir))
     sys.path.insert(0, str(Path(ygoinf_dir).resolve() if ygoinf_dir else ROOT / "ygoinf"))
-    P, penv, renv, db, decks = make_envs(deck_dir, deck1, deck2, seed, with_ref)
+    P, penv, renv, db, decks = make_envs(deck_dir, deck1, deck2, seed, with_ref, obs_version)
     from ygoinf import features as F
     from ygoinf import models as Mo
     F.code_to_id.clear()
     F.init_code_list("code_list.txt")
+    if obs_version != 1:
+        F.set_obs_version(obs_version)
     if hasattr(F, "init_announce"):
         F.init_announce(db, [deck_dir])
     card_data = load_card_data(db, [c for c in F.code_to_id if c != 0])
 
-    client = RefClient(F, Mo, view, card_data)
+    client = RefClient(F, Mo, view, card_data, obs_version)
     rng = np.random.default_rng(seed)
     KEYS = ("cards_", "global_", "actions_", "h_actions_")
     col_diff = Counter()       # (key, feature) -> decisions with a difference
@@ -813,7 +873,7 @@ def run(deck_dir="~/ygo/decks/mine", deck1="random", deck2="random", games=20, s
         if after_terminal:
             done_games += 1
             desync_skip = False
-    return dict(view=view, games=games, steps=steps, compared=compared, harness_diff=harness_diff,
+    return dict(view=view, obs_version=obs_version, games=games, steps=steps, compared=compared, harness_diff=harness_diff,
                 col_diff={f"{k}.{f}": n for (k, f), n in sorted(col_diff.items())},
                 by_msg=dict(by_msg), by_msg_bad=dict(by_msg_bad), errors=dict(errors),
                 stats=dict(client.stats), announce=dict(announce), announce_ok=dict(announce_ok),
@@ -854,7 +914,8 @@ def resolve(client, F, obs, info, KEYS, col_diff, examples, by_msg, by_msg_bad, 
             return "desync"
         preds = res.action_preds
         valid = [j for j, pr in enumerate(preds) if pr.prob != -1]
-        discard = d.get("discard_hint") and d["st"][0].phase == PHASE_END and d["m"] == M["SELECT_CARD"]
+        discard = (d.get("discard_hint") and d["st"][0].phase == PHASE_END and d["m"] == M["SELECT_CARD"]
+                   and not client.v2)
         if discard:
             # env picks at random: no observation, no history. Pick like the env
             # can't be reproduced; the field state follows from the snapshots.
@@ -991,18 +1052,19 @@ def main():
     ap.add_argument("--view", default="env", choices=["env", "client", "client-deck"])
     ap.add_argument("--ygoinf", default=None, help="folder that contains the ygoinf package (default: this checkout)")
     ap.add_argument("--no-ref", action="store_true", help="skip the comparison with ygopro_ygoenv")
+    ap.add_argument("--obs-version", type=int, default=1, choices=[1, 2])
     ap.add_argument("--json")
     a = ap.parse_args()
-    r = run(a.deck, a.deck1, a.deck2, a.games, a.seed, a.view, a.ygoinf, not a.no_ref)
+    r = run(a.deck, a.deck1, a.deck2, a.games, a.seed, a.view, a.ygoinf, not a.no_ref, obs_version=a.obs_version)
     report(r)
     if a.json:
         Path(a.json).write_text(json.dumps(r, indent=1))
     ok = r["harness_diff"] == 0 and not r["col_diff"] and not r["errors"]
-    sys.exit(0 if ok or a.view != "env" else 1)
+    sys.exit(0 if ok or (a.view != "env" and a.obs_version == 1) else 1)
 
 
 def report(r):
-    print(f"view {r['view']}: {r['games']} games, {r['steps']} env steps, {r['compared']} decisions compared")
+    print(f"obs_version {r.get('obs_version', 1)}, view {r['view']}: {r['games']} games, {r['steps']} env steps, {r['compared']} decisions compared")
     print(f"recording build vs ygopro_ygoenv: {r['harness_diff']} steps differ")
     print("decisions per message (compared / with a difference):")
     for k in sorted(r["by_msg"]):

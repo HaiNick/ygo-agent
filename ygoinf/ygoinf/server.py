@@ -20,7 +20,7 @@ from .models import (
     DuelPredictResponse,
     DuelPredictErrorResponse,
 )
-from .features import predict, init_code_list, init_announce, PredictState, Predictor
+from .features import predict, init_code_list, init_announce, set_obs_version, PredictState, Predictor
 
 
 class Settings(BaseSettings):
@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     state_expire: int = Field(default=3600, description="Duel state expire time in seconds")
     test_duel_id: str = Field(default="9654823a-23fd-4850-bb-6fec241740b0", description="Test duel id")
     ygo_num_threads: int = Field(default=1, description="Number of threads to use for YGO prediction")
+    obs_version: int = Field(
+        default=1,
+        description="Observation version the checkpoint was trained on (docs/OBS_V2.md): 1 or 2. "
+                    "It changes what ygoinf encodes and what the client must send, see the client "
+                    "contract in docs/notes/obs-v2-impl.md.")
     cards_db: str = Field(default="", description="cards.cdb for card-name declarations (the one the env loads)")
     announce_pool: str = Field(
         default="",
@@ -59,6 +64,8 @@ thread.start()
 @asynccontextmanager
 async def lifespan(app: FastAPI):    
     init_code_list(settings.code_list)
+    set_obs_version(settings.obs_version)
+    print(f"observation version {settings.obs_version}")
     if settings.cards_db and settings.announce_pool:
         ctx = init_announce(settings.cards_db, [p for p in settings.announce_pool.split(":") if p])
         print(f"announce_card: {len(ctx.pool_decks)} pool decks, {len(ctx.pool_ranked)} pool codes")

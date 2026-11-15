@@ -12,6 +12,9 @@ State-level parity (tools/ygoinf_parity.py, each in its own process; needs `xmak
      recording build gives the same observations as ygopro_ygoenv
   8. Artmage_DarkMagician mirror: the same, and at least one card-name declaration compared for each
      of The Black Goat Laughs, Crossout Designator and Artmage Academic Arcane Arts Acropolis
+Observation version 2 (docs/OBS_V2.md):
+  9. card rows carry the card id and the counter count
+ 10. decks/mine with --obs-version 2: env view and client view (own deck in any order) equal
 
 usage: python tools/test_ygoinf_encoding.py [--deck ~/ygo/decks/mine] [--steps 300]
          [--parity-games 10] [--announce-games 20]
@@ -69,6 +72,11 @@ check("card id columns are 0", x[0] == 0 and x[1] == 0)
 check("counter is 0 or 15", F.encode_card(card(counter=0))[10] == 0 and F.encode_card(card(counter=1))[10] == 15
       and F.encode_card(card(counter=3))[10] == 15)
 check("level is clamped to 13", F.encode_card(card(level=15))[9] == 13)
+F.set_obs_version(2)
+x2 = F.encode_card(card(counter=3))
+check("version 2: card id columns hold the id, counter is the count",
+      int(x2[0]) * 256 + int(x2[1]) == len(lines) and x2[10] == 3 and F.encode_card(card(counter=40))[10] == 15)
+F.set_obs_version(1)
 
 # 4. history
 st = F.PredictState()
@@ -154,6 +162,14 @@ if r is not None:
                      (ACROPOLIS, "Artmage Academic Arcane Arts Acropolis")):
         n, ok = got.get(code, (0, 0))
         check(f"declaration by {nm} compared and equal", n > 0 and ok == n, f"{ok} of {n}")
+
+for view in ("env", "client"):
+    r = parity(f"parity decks/mine, obs_version 2, {view} view",
+               ["--games", str(args.parity_games), "--seed", "0", "--obs-version", "2", "--view", view])
+    if r is not None:
+        check(f"parity decks/mine, obs_version 2, {view} view: all observation arrays equal",
+              r["harness_diff"] == 0 and r["compared"] > 0 and not r["col_diff"] and not r["errors"],
+              f"{r['compared']} decisions, differences {r['col_diff'] or 'none'}, errors {r['errors'] or 'none'}")
 
 print("FAILED: " + ", ".join(fails) if fails else "all checks passed")
 sys.exit(1 if fails else 0)
