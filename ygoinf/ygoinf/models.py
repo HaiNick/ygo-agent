@@ -180,6 +180,11 @@ class SelectSumCard(BaseModel):
     level1: int
     level2: int
     response: int
+    code: int = Field(
+        0,
+        description='Optional. The card code as given in the message. The env records it in the action '
+                    'history when it answers a selection with a single option itself.',
+    )
 
 
 class MsgSelectSum(BaseModel):
@@ -197,6 +202,11 @@ class SelectTributeCard(BaseModel):
     location: CardLocation
     level: int
     response: int
+    code: int = Field(
+        0,
+        description='Optional. The card code as given in the message. The env records it in the action '
+                    'history when it answers a selection with a single option itself.',
+    )
 
 
 class MsgSelectTribute(BaseModel):
@@ -211,6 +221,18 @@ class MsgSelectTribute(BaseModel):
 class SelectAbleCard(BaseModel):
     location: CardLocation
     response: int
+    code: int = Field(
+        0,
+        description='Optional. The card code as given in the message. The env records it in the action '
+                    'history when it answers a selection with a single option itself.',
+    )
+    confirmed: bool = Field(
+        False,
+        description='Optional. True for a card in the deck or extra deck (either player) whose code was '
+                    'shown in MSG_CONFIRM_CARDS, MSG_CONFIRM_DECKTOP or MSG_CONFIRM_EXTRATOP for that '
+                    'controller and location since the last MSG_CHAIN_SOLVED. The env then uses the code as '
+                    'the action card id (confirmed_spec_codes_ in ygopro.h).',
+    )
 
 
 class MsgSelectCard(BaseModel):
@@ -220,6 +242,13 @@ class MsgSelectCard(BaseModel):
     max: int
     cards: List[SelectAbleCard]
     selected: List[int]
+    select_hint: int = Field(
+        0,
+        description='Optional. Value of the last MSG_HINT with type HINT_SELECTMSG (3) the client '
+                    'received before this message, 0 if none. With 501 (discard) during the End Phase '
+                    'the env picks the cards at random without the model: ygoinf then returns uniform '
+                    'probabilities and does not record the choice in the action history.',
+    )
 
 
 class Race(Enum):
@@ -287,13 +316,15 @@ class Card(BaseModel):
     location: Location = Field(..., examples=['hand', 'deck'])
     sequence: int = Field(
         ...,
-        description='Sequence in ocgcore, 0 is N/A or unknown, if not, shoud start from 1. Only non-zero for cards in mzone, szone and grave.',
+        description='Sequence in ocgcore, starting from 0 (the encoder adds 1). Used for cards in mzone, szone and grave.',
         examples=[1],
     )
     controller: Controller = Field(..., examples=['me'])
     position: Position = Field(
         ...,
-        description='If the monster is xyz material (overlay_sequence != -1), the position is faceup.',
+        description='If the monster is xyz material (overlay_sequence != -1), the position is faceup. '
+                    'For an opponent card in the deck, hand or extra deck that the env shows as a count only, '
+                    'send none (see docs/notes/ygoinf-announce.md, "Client contract").',
         examples=['faceup_attack'],
     )
     overlay_sequence: int = Field(..., description='if is overlay, this is the overlay index, starting from 0, else -1.')
@@ -364,6 +395,11 @@ class MsgName(Enum):
 class SelectUnselectCard(BaseModel):
     location: CardLocation
     response: int
+    code: int = Field(
+        0,
+        description='Optional. The card code as given in the message. The env records it in the action '
+                    'history when it answers a selection with a single option itself.',
+    )
 
 
 class MsgSelectUnselectCard(BaseModel):

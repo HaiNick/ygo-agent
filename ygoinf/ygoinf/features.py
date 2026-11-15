@@ -416,6 +416,10 @@ class LegalAction(BaseModel):
         0, description='The card id.')
     response: int = Field(
         -100, description="The response to be send to the server.")
+    msg_code: int = Field(
+        0, description='Card code from the message, used for the history of single-option decisions.')
+    hint: bool = Field(
+        False, description='card_id comes from a confirmed card (select_card), not from the action itself.')
     can_finish: bool = Field(
         False, description='Temporary field for select_sum')
 
@@ -481,8 +485,11 @@ def encode_card(card: Card):
     if overlay:
         position = Position.faceup
     elif card.location in [Location.deck, Location.hand, Location.extra]:
+        # The env writes only "face-down" or nothing here (_set_obs_card_).
         if position in [Position.facedown_defense, Position.facedown, Position.facedown_attack]:
             position = Position.facedown
+        else:
+            position = Position.none
     x[5] = position_to_id[position]
 
     x[6] = overlay_to_id[overlay]
@@ -518,9 +525,18 @@ def encode_cards(cards: List[Card]):
     x = np.zeros((2*MAX_CARDS, N_CARD_FEATURES), dtype=np.uint8)
     for i, card in enumerate(cards):
         x[i] = encode_card(card)
+        if is_count_only(card):
+            # The env writes these rows from the card count and has no spec
+            # for them (_set_obs_cards), so actions can't point at them.
+            continue
         spec = get_spec(card)
         spec_infos[spec] = (i + 1, get_code_id(card.code))
     return x, spec_infos
+
+
+def is_count_only(card: Card):
+    return (card.controller == Controller.opponent and card.position == Position.none
+            and card.location in [Location.deck, Location.hand, Location.extra])
 
 
 def count_location_cards(cards: List[Card]):
@@ -656,7 +672,11 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
     if action_msg.data.msg_type == "select_idlecmd":
         actions = []
         msg: MsgSelectIdleCmd = action_msg.data
+        has_bp = any(cmd.cmd_type == IdleCmdType.to_bp for cmd in msg.idle_cmds)
         for cmd in msg.idle_cmds:
+            if cmd.cmd_type == IdleCmdType.to_ep and has_bp:
+                # the env offers no End Phase when the Battle Phase is possible
+                continue
             action = LegalAction(msg=MsgName.select_idlecmd)
             if cmd.data is not None:
                 action.response = cmd.data.response
@@ -688,9 +708,6 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
                 action.phase = ActionPhase.battle
                 action.response = 6
             elif cmd.cmd_type == IdleCmdType.to_ep:
-                # TODO: Train model to support it
-                # if has_bp:
-                #     continue
                 action.phase = ActionPhase.end
                 action.response = 7
             actions.append(action)
@@ -722,6 +739,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
         for pos in msg.positions:
             action = LegalAction(msg=MsgName.select_position)
             action.position = pos
+            action.card_id = get_code_id(msg.code)
             action.response = posotion_to_response(pos)
             actions.append(action)
     elif action_msg.data.msg_type == "select_yesno":
@@ -768,7 +786,11 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
     elif action_msg.data.msg_type == "select_battlecmd":
         actions = []
         msg: MsgSelectBattleCmd = action_msg.data
+        has_m2 = any(cmd.cmd_type == BattleCmdType.to_m2 for cmd in msg.battle_cmds)
         for cmd in msg.battle_cmds:
+            if cmd.cmd_type == BattleCmdType.to_ep and has_m2:
+                # the env offers no End Phase when Main Phase 2 is possible
+                continue
             action = LegalAction(msg=MsgName.select_battlecmd)
             if cmd.data is not None:
                 action.spec = to_spec(cmd.data.card_info)
@@ -795,9 +817,6 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
                 action.phase = ActionPhase.main2
                 action.response = 2
             elif cmd.cmd_type == BattleCmdType.to_ep:
-                # TODO: Train model to support it
-                # if has_m2:
-                #     continue
                 action.response = 3
                 action.phase = ActionPhase.end
             actions.append(action)
@@ -824,14 +843,17 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             action.response = i
             action.place = place_to_select(place)
             actions.append(action)
+        # the env lists places in flag order: m1-m7, s1-s8, om1-om7, os1-os8
+        actions.sort(key=lambda a: place_to_id[a.place])
     elif action_msg.data.msg_type == "select_disfield":
         actions = []
         msg: MsgSelectDisfield = action_msg.data
-        for place in msg.places:
+        for i, place in enumerate(msg.places):
             action = LegalAction(msg=MsgName.select_disfield)
-            action.response = -1
+            action.response = i
             action.place = place_to_select(place)
             actions.append(action)
+        actions.sort(key=lambda a: place_to_id[a.place])
     elif action_msg.data.msg_type == "announce_attrib":
         actions = []
         msg: MsgAnnounceAttrib = action_msg.data
@@ -848,7 +870,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
         if msg.count != 1:
             raise NotImplementedError("Multiple numbers are not supported.")
         for number in msg.numbers:
-            if number <= 0 or number > 12:
+            if number.number <= 0 or number.number > 12:
                 raise NotImplementedError(
                     "Number out of range, only 1-12 are supported.")
             action = LegalAction(msg=MsgName.announce_number)
@@ -862,6 +884,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             action = LegalAction(msg=MsgName.select_unselect_card)
             action.response = card.response
             action.spec = to_spec(card.location)
+            action.msg_code = getattr(card, 'code', 0)
             actions.append(action)
         if msg.finishable:
             action = LegalAction(msg=MsgName.select_unselect_card)
@@ -892,9 +915,15 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
         idx = len(msg.selected)
         for i, spec in enumerate(specs):
             if i not in msg.selected:
+                c = msg.cards[i]
                 action = LegalAction(msg=msg_name)
                 action.response = responses[i]
                 action.spec = spec
+                action.msg_code = getattr(c, 'code', 0)
+                if getattr(c, 'confirmed', False) and action.msg_code:
+                    # confirmed deck card: the env uses its code as the card id
+                    action.card_id = get_code_id(action.msg_code)
+                    action.hint = True
                 actions.append(action)
         if (idx == msg.max - 1 and idx >= msg.min) or idx >= msg.min:
             action = LegalAction(msg=msg_name)
@@ -943,18 +972,18 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             else:
                 can_finish[i] = can_finish[i] or f
         actions = []
-        for i, f in can_finish.items():
-            action = LegalAction(msg=MsgName.select_tribute)
+        for i, f in sorted(can_finish.items()):
+            action = LegalAction(msg=MsgName.select_sum)
             c = msg.cards[i]
             action.response = c.response
             action.spec = to_spec(c.location)
+            action.msg_code = getattr(c, 'code', 0)
             action.can_finish = f
             actions.append(action)
     return actions
 
 
 def encode_legal_actions(actions: List[LegalAction], spec_infos):
-    print(actions[0].msg)
     actions = actions[:MAX_ACTIONS]
     x = np.zeros((MAX_ACTIONS, N_ACTION_FEATURES), dtype=np.uint8)
     for i, action in enumerate(actions):
@@ -969,14 +998,12 @@ def encode_legal_actions(actions: List[LegalAction], spec_infos):
 def transform_select_idx(probs, idx: int, action_msg: ActionMsg):
     if probs[idx] == -1:
         raise ValueError("Invalid action selected (prob == -1)")
-    k = idx
-    if action_msg.data.msg_type in ["select_card", "select_tribute", "select_sum"]:
-        k = 0
-        for i in range(len(probs)):
-            if probs[i] != -1:
-                if i == idx:
-                    break
-                k += 1
+    # entries with prob -1 (cards already selected, the End Phase the env
+    # doesn't offer, truncated actions) have no row in the encoded actions
+    k = 0
+    for i in range(idx):
+        if probs[i] != -1:
+            k += 1
     # If idx is pad, it is input error, we don't need to handle it
     # If idx is truncated, it is -1 and already handled
     return k
@@ -1009,6 +1036,17 @@ def add_skipped_back(probs, legal_actions, action_msg: ActionMsg):
     msg_type = action_msg.data.msg_type
     responses = [a.response for a in legal_actions]
     can_finish = [False] * len(responses)
+    if msg_type in ["select_idlecmd", "select_battlecmd"]:
+        cmds = action_msg.data.idle_cmds if msg_type == "select_idlecmd" else action_msg.data.battle_cmds
+        other = IdleCmdType.to_bp if msg_type == "select_idlecmd" else BattleCmdType.to_m2
+        ep = IdleCmdType.to_ep if msg_type == "select_idlecmd" else BattleCmdType.to_ep
+        types = [c.cmd_type for c in cmds]
+        if other in types and ep in types:
+            i = types.index(ep)
+            probs.insert(i, -1)
+            responses.insert(i, 7 if msg_type == "select_idlecmd" else 3)
+            can_finish.insert(i, False)
+
     if msg_type in ["select_card", "select_tribute", "select_sum"]:
         can_finish = [a.can_finish for a in legal_actions]
         if msg_type == 'select_sum':
@@ -1021,14 +1059,16 @@ def add_skipped_back(probs, legal_actions, action_msg: ActionMsg):
                 responses.insert(i, action_msg.data.cards[i].response)
                 can_finish.insert(i, False)
         else:
-            skipped = action_msg.data.selected
+            skipped = sorted(action_msg.data.selected)
             for i in skipped:
                 probs.insert(i, -1)
                 responses.insert(i, action_msg.data.cards[i].response)
+                can_finish.insert(i, False)
             if len(probs) == len(action_msg.data.cards):
                 # finish
                 probs.append(-1)
                 responses.append(-1)
+                can_finish.append(False)
     return probs, responses, can_finish
 
 
@@ -1068,6 +1108,8 @@ class PredictState:
         self.rstate = init_rstate()
         self.index = 0
         self.history_actions = HistoryActions()
+        self.skip_history = False
+        self.last_model = False
 
         self.reset()
 
@@ -1084,8 +1126,9 @@ class PredictState:
         idx1 = transform_select_idx(self._probs, idx, self._action_msg)
         action = self._actions[idx1]
         # the env does not record cancels (update_history_actions in ygopro.h)
-        if action[4] != action_act_to_id[ActionAct.cancel]:
+        if action[4] != action_act_to_id[ActionAct.cancel] and not self.skip_history:
             self.history_actions.update(action, self._turn, self._phase)
+        self.skip_history = False
         self.reset()
 
     def record(self, input: Input, actions, probs):
@@ -1103,6 +1146,28 @@ def revert_pad_truncate(probs, n_actions):
         probs = probs[:n_actions]
     return probs
 
+def auto_card_id(action: LegalAction, spec_infos):
+    """Card id the env records for a decision it answers itself: the card at
+    the spec, ignoring an xyz material index (so a material gives the xyz
+    monster), the real code also for a face-down card, and 0 for an opponent
+    card the observation shows as a count only."""
+    spec = action.spec
+    i = spec.find("a")
+    base = spec[:i] if i > 0 else spec
+    if base not in spec_infos:
+        return 0
+    cid = spec_infos[base][1]
+    if cid == 0 and i < 0 and action.msg_code:
+        cid = get_code_id(action.msg_code)
+    return cid
+
+
+def is_random_discard(input: Input):
+    data = input.action_msg.data
+    return (data.msg_type == "select_card" and getattr(data, "select_hint", 0) == 501
+            and input.global_.phase == Phase.end)
+
+
 def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
     if state.index != 0:
         state.update_history_actions(prev_action_idx)
@@ -1112,6 +1177,7 @@ def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
 
     cards, spec_infos = encode_cards(input.cards)
     global_ = encode_global(input.global_, input.cards)
+    preset_ids = [0 if a.hint else a.card_id for a in legal_actions]
     actions = encode_legal_actions(legal_actions, spec_infos)
     h_actions = state.history_actions.encode(input.global_.turn)
     model_input = {
@@ -1120,12 +1186,33 @@ def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
         "actions_": actions,
         "h_actions_": h_actions,
     }
-    if n_actions == 1:
-        probs = [1.0]
-        responses = [legal_actions[0].response]
+    if is_random_discard(input):
+        # The env answers this selection at random without the model and
+        # keeps it out of the action history (discard_hand_ in ygopro.h).
+        probs = [1.0 / n_actions] * n_actions
+        probs, responses, can_finish = add_skipped_back(probs, legal_actions, input.action_msg)
+        preds = [ActionPredict(prob=p, response=r, can_finish=f) for p, r, f in zip(probs, responses, can_finish)]
+        state.skip_history = True
+        state.last_model = False
+        state.record(input, actions, probs)
+        state.index += 1
+        return MsgResponse(action_preds=preds, win_rate=-1)
+    # The env answers a single option itself, except in a card selection that
+    # continues after a pick by the model: step() then shows it (ygopro.h
+    # handle_multi_select is called from step without the single-option check).
+    shown = (n_actions == 1 and state.last_model and
+             input.action_msg.data.msg_type in ("select_card", "select_tribute", "select_sum") and
+             len(input.action_msg.data.selected) > 0)
+    if n_actions == 1 and not shown:
+        # The env answers this itself and records it in the history with
+        # spec_to_card_id (ygopro.h) instead of the observation's card id.
+        if preset_ids[0] == 0 and legal_actions[0].spec:
+            actions[0, 1:3] = int_transform(auto_card_id(legal_actions[0], spec_infos))
+        probs, responses, can_finish = add_skipped_back([1.0], legal_actions, input.action_msg)
         win_rate = -1
-        can_finish = [legal_actions[0].can_finish]
+        state.last_model = False
     else:
+        state.last_model = True
         rstate, probs, value = model_fn(state.rstate, model_input)
         state.rstate = rstate
         probs = revert_pad_truncate(probs, n_actions)
