@@ -2875,6 +2875,12 @@ private:
                 hide = false;
               }
             }
+            if (obs_v2(to_play) && (c.location_ & LOCATION_OVERLAY)) {
+              // An xyz material is public. Its position_ holds the overlay
+              // index, so the face-down test above is meaningless for it
+              // (version 1 keeps that: no id for such a material's spec).
+              hide = false;
+            }
             CardId card_id = 0;
             if (!hide) {
               card_id = c_get_card_id(c.code_);
@@ -2883,7 +2889,10 @@ private:
             // tokens can exceed that; writing on would run into the next
             // env's slice of the batch.
             if (offset >= max_rows) break;
-            _set_obs_card_(f_cards, offset, c, hide);
+            // Version 1 never wrote the card id into the card rows (K1): the
+            // model saw id 0 for every card. Version 2 writes it for every
+            // row whose features are written (docs/OBS_V2.md, B1).
+            _set_obs_card_(f_cards, offset, c, hide, obs_v2(to_play) ? card_id : 0);
             offset++;
 
             spec_infos[spec] = {static_cast<uint16_t>(offset), card_id};
