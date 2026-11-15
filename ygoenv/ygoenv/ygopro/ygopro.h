@@ -2027,6 +2027,11 @@ protected:
   std::unordered_map<uint32_t, std::vector<CardCode>> confirmed_locs_;
   // current selection: spec -> code for confirmed cards the observation has no slot for
   std::unordered_map<std::string, CardCode> confirmed_spec_codes_;
+  // Version 2, current decision: spec -> code for action cards in the deciding
+  // player's own deck. In card selections the core numbers such candidates
+  // 0, 1, 2, ... (card::get_select_sequence) instead of giving their sequence,
+  // so the spec doesn't name the card's row. The row is found by this code.
+  std::unordered_map<std::string, CardCode> deck_spec_codes_;
 
   // multi select
   int ms_idx_ = -1;
@@ -2182,6 +2187,7 @@ public:
     seen_codes_[1].clear();
     confirmed_locs_.clear();
     confirmed_spec_codes_.clear();
+    deck_spec_codes_.clear();
 
     history_actions_1_.Zero();
     history_actions_2_.Zero();
@@ -2727,11 +2733,58 @@ public:
     n_options = legal_actions_.size();
     state["info:num_options"_] = n_options;
 
+    // Version 2: an action card in the own deck is found by its code, not by
+    // the sequence in the message. Actions in order: each takes the first
+    // own-deck row with its code that no earlier action took, or the first
+    // such row if all are taken. Rows of equal cards are identical and the
+    // model has no positional encoding on the card rows, so any of them is
+    // right. ygoinf uses the same rule (resolve_own_deck).
+    std::vector<std::pair<int, CardId>> deck_rows;  // (row + 1, card id)
+    std::vector<char> deck_row_used;
+    const bool by_code = obs_v2(to_play_) && !deck_spec_codes_.empty();
+    if (by_code) {
+      for (int k = 1;; ++k) {
+        auto it = spec_infos.find(std::to_string(k));
+        if (it == spec_infos.end()) {
+          break;
+        }
+        deck_rows.emplace_back(it->second.index, it->second.cid);
+      }
+      deck_row_used.assign(deck_rows.size(), 0);
+    }
+
     for (int i = 0; i < n_options; ++i) {
       auto &action = legal_actions_[i];
       action.msg_ = msg_;
       const auto &spec = action.spec_;
       if (!spec.empty()) {
+        if (by_code) {
+          auto dc = deck_spec_codes_.find(spec);
+          auto id_it = dc != deck_spec_codes_.end() ? card_ids_.find(dc->second) : card_ids_.end();
+          int found = -1;
+          if (id_it != card_ids_.end()) {
+            for (int j = 0; j < static_cast<int>(deck_rows.size()); ++j) {
+              if (deck_rows[j].second != id_it->second) {
+                continue;
+              }
+              if (!deck_row_used[j]) {
+                found = j;
+                break;
+              }
+              if (found < 0) {
+                found = j;
+              }
+            }
+          }
+          if (found >= 0) {
+            deck_row_used[found] = 1;
+            action.spec_index_ = deck_rows[found].first;
+            if (action.cid_ == 0) {
+              action.cid_ = id_it->second;
+            }
+            continue;
+          }
+        }
         auto hint = confirmed_spec_codes_.find(spec);
         if (hint != confirmed_spec_codes_.end()) {
           // Card confirmed to this player this chain (e.g. opponent deck top):
@@ -3485,7 +3538,14 @@ private:
             auto la = legal_actions_[0];
             la.msg_ = msg_;
             if (la.cid_ == 0 && !la.spec_.empty()) {
-              la.cid_ = spec_to_card_id(la.spec_, to_play_);
+              auto dc = deck_spec_codes_.find(la.spec_);
+              auto id_it = dc != deck_spec_codes_.end() ? card_ids_.find(dc->second) : card_ids_.end();
+              if (id_it != card_ids_.end()) {
+                // version 2, own deck card: the id of the code in the message
+                la.cid_ = id_it->second;
+              } else {
+                la.cid_ = spec_to_card_id(la.spec_, to_play_);
+              }
             }
             update_history_actions(to_play_, la);
             if (verbose_) {
@@ -3720,6 +3780,7 @@ private:
         }
       }
       card_specs.push_back({code, ls_to_spec(loc, seq, 0, player != controller), data});
+      note_own_deck_spec(player, controller, loc, std::get<1>(card_specs.back()), code);
     }
     return card_specs;
   }
@@ -3780,6 +3841,15 @@ private:
     if (it != confirmed_locs_.end() &&
         std::find(it->second.begin(), it->second.end(), code) != it->second.end()) {
       confirmed_spec_codes_[spec] = code;
+    }
+  }
+
+  // Version 2: remember the code of an action card in the deciding player's
+  // own deck (see deck_spec_codes_).
+  void note_own_deck_spec(PlayerId player, uint32_t controller, uint32_t loc,
+                          const std::string &spec, CardCode code) {
+    if (obs_v2(player) && controller == player && loc == LOCATION_DECK) {
+      deck_spec_codes_[spec] = code & 0x7fffffff;
     }
   }
 
@@ -3914,6 +3984,7 @@ private:
     msg_ = int(data_[dp_++]);
     legal_actions_ = {};
     confirmed_spec_codes_.clear();  // hints belong to one decision
+    deck_spec_codes_.clear();
     track_seen_codes();
 
     if (verbose_) {
@@ -4901,18 +4972,20 @@ private:
           card.set_location(loc);
           auto spec = card.get_spec(player);
           select_specs.push_back(spec);
+          note_own_deck_spec(player, card.controler_, card.location_, spec, code);
           auto s = fmt::format("{}: {}({})", i + 1, card.name_, spec);
           pl->notify(s);
         }
       } else {
         for (int i = 0; i < select_size; ++i) {
-          dp_ += 4;
+          CardCode code = read_u32();
           auto controller = read_u8();
           auto loc = read_u8();
           auto seq = read_u8();
           auto pos = read_u8();
           auto spec = ls_to_spec(loc, seq, pos, controller != player);
           select_specs.push_back(spec);
+          note_own_deck_spec(player, controller, loc, spec, code);
         }
       }
 
@@ -4972,6 +5045,7 @@ private:
           auto spec = card.get_spec(player);
           specs.push_back(spec);
           note_confirmed_spec(card.controler_, card.location_, card.sequence_, spec, card.code_);
+          note_own_deck_spec(player, card.controler_, card.location_, spec, card.code_);
           int i = specs.size();
           if (card.controler_ != player && card.position_ & POS_FACEDOWN) {
             pl->notify(
@@ -4991,6 +5065,7 @@ private:
           auto spec = ls_to_spec(loc, seq, pos, controller != player);
           specs.push_back(spec);
           note_confirmed_spec(controller, loc, seq, spec, code);
+          note_own_deck_spec(player, controller, loc, spec, code);
         }
       }
 
@@ -5065,7 +5140,7 @@ private:
         }
       } else {
         for (int i = 0; i < size; ++i) {
-          dp_ += 4;
+          CardCode code = read_u32();
           auto controller = read_u8();
           auto loc = read_u8();
           auto seq = read_u8();
@@ -5073,6 +5148,7 @@ private:
 
           auto spec = ls_to_spec(loc, seq, 0, controller != player);
           specs.push_back(spec);
+          note_own_deck_spec(player, controller, loc, spec, code);
 
           release_params.push_back(release_param);
         }
@@ -5193,7 +5269,7 @@ private:
         }
       } else {
         for (int i = 0; i < select_size; ++i) {
-          dp_ += 4;
+          CardCode code = read_u32();
           auto controller = read_u8();
           auto loc = read_u8();
           auto seq = read_u8();
@@ -5202,6 +5278,7 @@ private:
           auto spec = ls_to_spec(loc, seq, 0, controller != player);
           select_specs.push_back(spec);
           select_params.push_back(param);
+          note_own_deck_spec(player, controller, loc, spec, code);
         }
       }
 
@@ -5259,6 +5336,7 @@ private:
         uint8_t seq = read_u8();
         uint8_t pos = read_u8();
         specs.push_back(ls_to_spec(loc, seq, pos, c != player));
+        note_own_deck_spec(player, c, loc, specs.back(), code);
         uint32_t desc = read_u32();
         descs.push_back(desc);
       }
@@ -5384,6 +5462,7 @@ private:
       auto pos = read_u8();
       auto desc = read_u32();
       std::string spec = ls_to_spec(loc, seq, pos, ct != player);
+      note_own_deck_spec(player, ct, loc, spec, code);
       auto [code_d, eff_idx] = unpack_desc(code, desc);
       if (desc == 0) {
         code_d = code;
