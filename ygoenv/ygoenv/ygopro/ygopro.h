@@ -2750,7 +2750,23 @@ public:
 
     // we can't shuffle because idx must be stable in callback
     if (n_options > max_options()) {
-      legal_actions_.resize(max_options());
+      if (obs_v2(to_play_) && (msg_ == MSG_SELECT_IDLECMD || msg_ == MSG_SELECT_BATTLECMD)) {
+        // Version 2 (docs/OBS_V2.md, D1): the phase changes are the last
+        // entries, so the cut removed them and the turn could not be ended.
+        // Keep the first max_options - n entries and append the n phase
+        // changes. The kept entries stay at their index, which the callbacks
+        // rely on.
+        std::vector<LegalAction> phases;
+        for (const auto &a : legal_actions_) {
+          if (a.phase_ != ActionPhase::None) {
+            phases.push_back(a);
+          }
+        }
+        legal_actions_.resize(max_options() - phases.size());
+        legal_actions_.insert(legal_actions_.end(), phases.begin(), phases.end());
+      } else {
+        legal_actions_.resize(max_options());
+      }
     }
 
     n_options = legal_actions_.size();
@@ -5103,15 +5119,19 @@ private:
       to_play_ = player;
       callback_ = [this, n_activatables, n_attackables, to_ep, to_m2](int idx) {
         const auto &la = legal_actions_[idx];
-        if (idx < n_activatables) {
+        // The phase is tested first: with version 2 a phase change kept
+        // under the cut sits at an index below the number of cards. Without
+        // the cut a phase change is always behind them, so the order of the
+        // tests makes no difference for version 1.
+        if ((la.phase_ == ActionPhase::End) && to_ep) {
+          YGO_SetResponsei(pduel_, 3);
+        } else if ((la.phase_ == ActionPhase::Main2) && to_m2) {
+          YGO_SetResponsei(pduel_, 2);
+        } else if (idx < n_activatables) {
           YGO_SetResponsei(pduel_, idx << 16);
         } else if (idx < (n_activatables + n_attackables)) {
           idx = idx - n_activatables;
           YGO_SetResponsei(pduel_, (idx << 16) + 1);
-        } else if ((la.phase_ == ActionPhase::End) && to_ep) {
-          YGO_SetResponsei(pduel_, 3);
-        } else if ((la.phase_ == ActionPhase::Main2) && to_m2) {
-          YGO_SetResponsei(pduel_, 2);
         } else {
           throw std::runtime_error("Invalid option");
         }
