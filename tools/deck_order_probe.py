@@ -57,6 +57,7 @@ p.add_argument("--seed", type=int, default=0)
 p.add_argument("--env-threads", type=int, default=8)
 p.add_argument("--max-steps", type=int, default=20000, help="safety stop (batched steps)")
 p.add_argument("--json")
+p.add_argument("--obs-version", type=int, default=1, help="observation version of the env (docs/OBS_V2.md)")
 args = p.parse_args()
 deck_path = os.path.abspath(os.path.expanduser(args.deck))
 ckpt_path = os.path.abspath(os.path.expanduser(args.checkpoint))
@@ -120,7 +121,7 @@ N = args.games
 WITH_IDS = args.variant == "ids"
 cfg = dict(task_id="YGOPro-v1", env_type="gymnasium", num_envs=N, num_threads=min(args.env_threads, N),
            seed=args.seed, deck1=deck, deck2=deck, player=-1, max_options=24, n_history_actions=32,
-           play_mode="self", async_reset=False, verbose=False, record=False)
+           play_mode="self", async_reset=False, verbose=False, record=False, obs_version=args.obs_version)
 envs = ygoenv.make(oppo_info=WITH_IDS, **cfg)
 check_env = ygoenv.make(oppo_info=False, **cfg) if (WITH_IDS and args.check_rebuild) else None
 KEYS = ("cards_", "global_", "actions_", "h_actions_")

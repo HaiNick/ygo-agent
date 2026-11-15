@@ -20,7 +20,12 @@
 # start passes these environment variables to tools/train_finetune.sh: INIT
 # (default: the promoted model), TB_OFFSET (default: 104906752 with that model),
 # SAVE_INTERVAL (default 500), XLA_MEM_FRACTION (default 0.65), NUM_ENVS,
-# ACTOR_THREADS, NUM_STEPS, DECK_DIR, SEED, EXTRA.
+# ACTOR_THREADS, NUM_STEPS, DECK_DIR, SEED, EXTRA, OBS_VERSION.
+#
+# Observation version (docs/OBS_V2.md): OBS_VERSION=2 with start trains on version 2 (INIT must
+# be a checkpoint for version 2, see tools/obs_v2_ckpt.py). resume, eval and record read the
+# version of a run from its cmd_args. eval and record play the run's checkpoint on its version
+# against the opponent on MODEL_OBS_VERSION (default 1, the promoted model's version).
 #
 # A stop saves the weights, not the optimizer state: every resume starts with
 # fresh Adam moments.
@@ -41,6 +46,11 @@ pick_run() {  # pick_run [NAME] -> sets RUN, DIR
   [[ -d "$DIR" ]] || die "run folder not found: $DIR"
 }
 newest_ckpt() { ls -t "$1"/checkpoints/*.flax_model 2>/dev/null | head -1 || true; }
+run_obs_version() {  # run_obs_version DIR -> the --obs_version of the run's cmd_args, 1 if absent
+  local v; v="$(grep -a -A1 -x -e '--obs_version' "$1/cmd_args" 2>/dev/null | tail -1 || true)"
+  [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 1
+}
+MODEL_OBS_VERSION="${MODEL_OBS_VERSION:-1}"
 state() {  # state DIR -> running | stopping | stopped | crashed | new
   local d="$1" r; r="$(basename "$d")"
   if tmux has-session -t "=$r" 2>/dev/null; then
@@ -122,8 +132,10 @@ record)
   # shellcheck disable=SC1091
   source "$YGO/.venv/bin/activate"
   echo "recording $games games: $(basename "$ck") vs $(basename "$opp"), deck $(basename "$deck" .ydk)"
+  obs=(); v="$(run_obs_version "$DIR")"
+  [[ "$v" != 1 || "$MODEL_OBS_VERSION" != 1 ]] && obs=(--obs_version1 "$v" --obs_version2 "$MODEL_OBS_VERSION")
   XLA_PYTHON_CLIENT_PREALLOCATE=false python "$REPO/scripts/battle.py" --deck "$deck" --checkpoint1 "$ck" \
-    --checkpoint2 "$opp" --num_embeddings 15017 --num_episodes "$games" --record > match.log 2>&1 \
+    --checkpoint2 "$opp" --num_embeddings 15017 --num_episodes "$games" --record "${obs[@]}" > match.log 2>&1 \
     || { tail -5 match.log; die "recording failed, see $out/match.log"; }
   grep -a "win_rate=" match.log | tail -1
   name="$(basename "$deck" .ydk)_$(basename "$ck" .flax_model)"
@@ -138,7 +150,8 @@ eval)
   if [[ -n "${1:-}" && -d "$RUNS/$1" ]]; then pick_run "$1"; shift; else pick_run ""; fi
   ck="$(newest_ckpt "$DIR")"; [[ -n "$ck" ]] || die "$RUN has no checkpoint yet"
   [[ "${1:-}" == full ]] && q=0 || q=1
-  QUICK=$q XLA_PYTHON_CLIENT_PREALLOCATE=false "$REPO/tools/eval_vs_baseline.sh" "$ck" "$MODEL"
+  QUICK=$q XLA_PYTHON_CLIENT_PREALLOCATE=false OBS_VERSION1="$(run_obs_version "$DIR")" \
+    OBS_VERSION2="$MODEL_OBS_VERSION" "$REPO/tools/eval_vs_baseline.sh" "$ck" "$MODEL"
   ;;
 tb)
   tmux has-session -t "=ygo_tb" 2>/dev/null && die "TensorBoard already runs: http://localhost:6006 (stop: tmux kill-session -t ygo_tb)"

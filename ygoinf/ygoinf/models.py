@@ -92,7 +92,13 @@ class MsgSelectOption(BaseModel):
 class CardLocation(BaseModel):
     controller: Controller = Field(..., examples=['me'])
     location: Location = Field(..., examples=['hand', 'deck'])
-    sequence: int = Field(..., description='Start from 0')
+    sequence: int = Field(
+        ...,
+        description="Start from 0. For a card in this player's own deck, send the sequence from the message "
+                    "unchanged (in the card selection messages the core numbers such cards 0, 1, 2, ... "
+                    "instead of giving their place in the deck) and send the card's code in the code field. "
+                    "With observation version 2 ygoinf finds the card row by that code.",
+    )
     overlay_sequence: int = Field(
         ...,
         description='if is overlay, this is the overlay index, starting from 0, else -1.',
@@ -414,6 +420,29 @@ class MsgName(Enum):
     announce_attrib = 'announce_attrib'
     announce_number = 'announce_number'
     announce_card = 'announce_card'
+    sort_card = 'sort_card'
+
+
+class SortCard(BaseModel):
+    location: CardLocation
+    response: int = Field(..., description='Index of the card in MSG_SORT_CARD')
+    code: int = Field(0, description='The card code as given in the message')
+    confirmed: bool = Field(
+        False,
+        description='As for select_card: true for a card in the deck or extra deck whose code was shown to '
+                    'this player since the last MSG_CHAIN_SOLVED.',
+    )
+
+
+class MsgSortCard(BaseModel):
+    """Observation version 2 only. MSG_SORT_CARD (the core's deck sort) as repeated picks: "which
+    of these cards goes on top next". Send one request per pick with the picks so far in
+    `selected`, until one card is left (n - 1 requests for n cards, none for a single card). The
+    answer to the core is one byte per card of the message: its place, 0 = on top. The k-th pick
+    gets place k (from 0), the card that is left the last place."""
+    msg_type: Literal['sort_card']
+    cards: List[SortCard]
+    selected: List[int] = Field(..., description='Indices (response values) of the cards picked so far, in pick order')
 
 
 class SelectUnselectCard(BaseModel):
@@ -478,12 +507,20 @@ class ActionMsg(BaseModel):
         MsgAnnounceAttrib,
         MsgAnnounceNumber,
         MsgAnnounceCard,
+        MsgSortCard,
     ] = Field(..., discriminator='msg_type')
 
 
 class Input(BaseModel):
     global_: Global = Field(..., alias='global')
-    cards: List[Card] = Field(..., max_items=160, min_items=2)
+    cards: List[Card] = Field(
+        ..., max_items=160, min_items=2,
+        description="All cards, own cards first, then the opponent's. Per player: deck, hand, monster zones, "
+                    "spell zones, graveyard, banished, extra deck. Per location in core sequence order, with "
+                    "one exception: the cards remaining in this player's own deck may come in any order. A "
+                    "client doesn't know the order of its shuffled deck, and the model can't see the order "
+                    "of the card rows. Send one entry per remaining deck card with its code.",
+    )
     action_msg: ActionMsg
 
 

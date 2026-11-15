@@ -245,6 +245,7 @@ msg_to_id = {
     MsgName.announce_attrib: 14,
     MsgName.announce_number: 15,
     MsgName.announce_card: 16,
+    MsgName.sort_card: 17,  # observation version 2 only
 }
 
 
@@ -437,6 +438,9 @@ class LegalAction(BaseModel):
         0, description='Card code from the message, used for the history of single-option decisions.')
     hint: bool = Field(
         False, description='card_id comes from a confirmed card (select_card), not from the action itself.')
+    deck_code: int = Field(
+        0, description="Card code from the message when the card is in this player's own deck. With "
+                       "observation version 2 the card row is found by this code, not by the sequence.")
     can_finish: bool = Field(
         False, description='Temporary field for select_sum')
 
@@ -474,6 +478,13 @@ def to_spec(x: Union[CardInfo, CardLocation]):
     return spec
 
 
+def own_deck_code(loc, code):
+    """The message's card code if loc is a card in this player's own deck, else 0."""
+    if code and loc.controller == Controller.me and loc.location == Location.deck:
+        return code & 0x7fffffff
+    return 0
+
+
 def int_transform(x):
     return x // 256, x % 256
 
@@ -486,11 +497,13 @@ def float_transform(x):
 def encode_card(card: Card):
     x = np.zeros(N_CARD_FEATURES, dtype=np.uint8)
 
-    # Columns 0-1 (card id) stay 0: the env never writes the card id into the
-    # card list (ygopro.h _set_obs_cards calls _set_obs_card_ without it), so
-    # the model was trained with id 0 for every card here. Card identity
-    # reaches the model through the action and history ids only.
-    get_code_id(card.code)  # still reject unknown codes
+    # Version 1: columns 0-1 (card id) stay 0. The env never wrote the card id
+    # into the card list (ygopro.h _set_obs_cards calls _set_obs_card_ without
+    # it), so those models were trained with id 0 for every card here.
+    # Version 2 writes the id (B1). A card the client can't see has code 0.
+    card_id = get_code_id(card.code)  # also rejects unknown codes
+    if OBS_VERSION >= 2:
+        x[0:2] = int_transform(card_id)
 
     x[2] = location_to_id[card.location]
     if card.location in [Location.mzone, Location.szone, Location.grave]:
@@ -513,9 +526,13 @@ def encode_card(card: Card):
     x[7] = attribute_to_id[card.attribute]
     x[8] = race_to_id[card.race]
     x[9] = min(max(card.level, 0), 13)
-    # The env stores the raw counter word (type | count << 16) clamped to 15,
-    # so training only ever saw 0 (no counters) or 15.
-    x[10] = 15 if card.counter > 0 else 0
+    # Version 1: the env stores the raw counter word (type | count << 16)
+    # clamped to 15, so training only ever saw 0 (no counters) or 15.
+    # Version 2: the count, clamped to 15 (E1).
+    if OBS_VERSION >= 2:
+        x[10] = min(max(card.counter, 0), 15)
+    else:
+        x[10] = 15 if card.counter > 0 else 0
     x[11] = negated_to_id[card.negated]
 
     x[12:14] = float_transform(card.attack)
@@ -538,6 +555,7 @@ def get_spec(c: Card):
 
 def encode_cards(cards: List[Card]):
     spec_infos = {}
+    deck_rows = {}
     cards = cards[:2*MAX_CARDS]
     x = np.zeros((2*MAX_CARDS, N_CARD_FEATURES), dtype=np.uint8)
     for i, card in enumerate(cards):
@@ -548,7 +566,61 @@ def encode_cards(cards: List[Card]):
             continue
         spec = get_spec(card)
         spec_infos[spec] = (i + 1, get_code_id(card.code))
+        if card.controller == Controller.me and card.location == Location.deck:
+            deck_rows.setdefault(get_code_id(card.code), []).append(i + 1)
+    # Own-deck rows by card id (see resolve_own_deck). Kept under a key no spec can have.
+    spec_infos[DECK_ROWS] = deck_rows
     return x, spec_infos
+
+
+DECK_ROWS = "#own_deck_rows"
+
+# Observation version, see docs/OBS_V2.md. 1 is what every checkpoint up to
+# ft_r4 was trained on. Set it with set_obs_version() before the first request.
+OBS_VERSION = 1
+
+
+def set_obs_version(version):
+    global OBS_VERSION
+    if version not in (1, 2):
+        raise ValueError(f"unknown obs_version {version}")
+    OBS_VERSION = version
+
+
+def resolve_own_deck(actions, spec_infos):
+    """Row and card id for every action whose card is in this player's own deck
+    (observation version 2 only).
+
+    The core hides the deck order from the selecting player: in select_card,
+    select_unselect_card, select_tribute and select_sum it numbers the deck
+    candidates 0, 1, 2, ... instead of sending their sequence. A client doesn't
+    know the order of its deck either and sends the remaining deck in any
+    order. So the sequence of an own-deck card in a message says nothing about
+    its row. The model can't see the row order (no positional encoding on the
+    card rows), and rows of equal cards are identical, so any row with the
+    card's code is right.
+
+    Rule, the same as in the env (ygopro.h, WriteState): actions in order, each
+    takes the first own-deck row with its code that no earlier action took,
+    or the first such row if all are taken.
+
+    Version 1 keeps the sequence from the message, like the version 1 env: there
+    a deck search points at the row with that number, which holds an unrelated
+    card, and the action takes that card's id.
+    Returns {action position: (card_index, card_id)}."""
+    if OBS_VERSION < 2:
+        return {}
+    deck_rows = spec_infos.get(DECK_ROWS, {})
+    out, used = {}, set()
+    for k, action in enumerate(actions):
+        cid = code_to_id.get(action.deck_code) if action.deck_code else None
+        if cid is None or cid not in deck_rows:
+            continue
+        rows = deck_rows[cid]
+        index = next((r for r in rows if r not in used), rows[0])
+        used.add(index)
+        out[k] = (index, cid)
+    return out
 
 
 def is_count_only(card: Card):
@@ -698,6 +770,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             if cmd.data is not None:
                 action.response = cmd.data.response
                 action.spec = to_spec(cmd.data.card_info)
+                action.deck_code = own_deck_code(cmd.data.card_info, cmd.data.card_info.code)
             if cmd.cmd_type == IdleCmdType.summon:
                 action.act = ActionAct.summon_faceup_attack
             elif cmd.cmd_type == IdleCmdType.sp_summon:
@@ -741,6 +814,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
                 code_d = code
             action.act = ActionAct.activate
             action.spec = to_spec(chain.location)
+            action.deck_code = own_deck_code(chain.location, code)
             action.effect = eff_idx
             if code_d != 0:
                 action.card_id = get_code_id(code_d)
@@ -791,6 +865,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             code_d = code
         action.act = ActionAct.activate
         action.spec = to_spec(msg.location)
+        action.deck_code = own_deck_code(msg.location, code)
         action.effect = eff_idx
         if code_d != 0:
             action.card_id = get_code_id(code_d)
@@ -812,6 +887,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             if cmd.data is not None:
                 action.spec = to_spec(cmd.data.card_info)
                 action.response = cmd.data.response
+                action.deck_code = own_deck_code(cmd.data.card_info, cmd.data.card_info.code)
             if cmd.cmd_type == BattleCmdType.activate:
                 action.act = ActionAct.activate
                 code_t = cmd.data.card_info.code
@@ -909,6 +985,25 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             action.card_id = get_code_id(code)
             action.response = code
             actions.append(action)
+    elif action_msg.data.msg_type == "sort_card":
+        msg: MsgSortCard = action_msg.data
+        if OBS_VERSION < 2:
+            raise NotImplementedError("sort_card needs observation version 2 (version 1 keeps the default order)")
+        if len(msg.cards) - len(msg.selected) < 2:
+            raise NotImplementedError("sort_card: the last card needs no pick")
+        actions = []
+        for i, c in enumerate(msg.cards):
+            if i in msg.selected:
+                continue
+            action = LegalAction(msg=MsgName.sort_card)
+            action.response = c.response
+            action.spec = to_spec(c.location)
+            action.msg_code = c.code
+            action.deck_code = own_deck_code(c.location, c.code)
+            if c.confirmed and c.code:
+                action.card_id = get_code_id(c.code)
+                action.hint = True
+            actions.append(action)
     elif action_msg.data.msg_type == "select_unselect_card":
         actions = []
         msg: MsgSelectUnselectCard = action_msg.data
@@ -917,6 +1012,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             action.response = card.response
             action.spec = to_spec(card.location)
             action.msg_code = getattr(card, 'code', 0)
+            action.deck_code = own_deck_code(card.location, action.msg_code)
             actions.append(action)
         if msg.finishable:
             action = LegalAction(msg=MsgName.select_unselect_card)
@@ -952,6 +1048,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
                 action.response = responses[i]
                 action.spec = spec
                 action.msg_code = getattr(c, 'code', 0)
+                action.deck_code = own_deck_code(c.location, action.msg_code)
                 if getattr(c, 'confirmed', False) and action.msg_code:
                     # confirmed deck card: the env uses its code as the card id
                     action.card_id = get_code_id(action.msg_code)
@@ -1010,6 +1107,7 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
             action.response = c.response
             action.spec = to_spec(c.location)
             action.msg_code = getattr(c, 'code', 0)
+            action.deck_code = own_deck_code(c.location, action.msg_code)
             action.can_finish = f
             actions.append(action)
     return actions
@@ -1018,8 +1116,9 @@ def get_legal_actions(action_msg: ActionMsg) -> List[LegalAction]:
 def encode_legal_actions(actions: List[LegalAction], spec_infos):
     actions = actions[:MAX_ACTIONS]
     x = np.zeros((MAX_ACTIONS, N_ACTION_FEATURES), dtype=np.uint8)
+    by_code = resolve_own_deck(actions, spec_infos)
     for i, action in enumerate(actions):
-        card_index, card_id = find_spec_info(spec_infos, action.spec)
+        card_index, card_id = by_code[i] if i in by_code else find_spec_info(spec_infos, action.spec)
         action.card_index = card_index
         if action.card_id == 0:
             action.card_id = card_id
@@ -1077,6 +1176,12 @@ def add_skipped_back(probs, legal_actions, action_msg: ActionMsg):
             i = types.index(ep)
             probs.insert(i, -1)
             responses.insert(i, 7 if msg_type == "select_idlecmd" else 3)
+            can_finish.insert(i, False)
+
+    if msg_type == "sort_card":
+        for i in sorted(action_msg.data.selected):
+            probs.insert(i, -1)
+            responses.insert(i, action_msg.data.cards[i].response)
             can_finish.insert(i, False)
 
     if msg_type in ["select_card", "select_tribute", "select_sum"]:
@@ -1183,6 +1288,9 @@ def auto_card_id(action: LegalAction, spec_infos):
     the spec, ignoring an xyz material index (so a material gives the xyz
     monster), the real code also for a face-down card, and 0 for an opponent
     card the observation shows as a count only."""
+    if OBS_VERSION >= 2 and action.deck_code and action.deck_code in code_to_id:
+        # own deck card: the row at the spec holds another card (resolve_own_deck)
+        return code_to_id[action.deck_code]
     spec = action.spec
     i = spec.find("a")
     base = spec[:i] if i > 0 else spec
@@ -1195,9 +1303,30 @@ def auto_card_id(action: LegalAction, spec_infos):
 
 
 def is_random_discard(input: Input):
+    # Version 2: the model chooses End Phase discards (G1).
     data = input.action_msg.data
-    return (data.msg_type == "select_card" and getattr(data, "select_hint", 0) == 501
+    return (OBS_VERSION < 2 and data.msg_type == "select_card" and getattr(data, "select_hint", 0) == 501
             and input.global_.phase == Phase.end)
+
+
+def encoded_positions(legal_actions, msg_type):
+    """Positions in legal_actions of the actions the model sees, in the order of the encoded
+    rows. At most MAX_ACTIONS. Version 1: the first ones. Version 2 (D1): an idle or battle
+    command with more actions keeps its phase changes (the last entries) and cuts in front
+    of them, like the env (ygopro.h WriteState)."""
+    n = len(legal_actions)
+    if n <= MAX_ACTIONS:
+        return list(range(n))
+    if OBS_VERSION >= 2 and msg_type in ("select_idlecmd", "select_battlecmd"):
+        phases = [i for i, a in enumerate(legal_actions) if a.phase != ActionPhase.none]
+        if phases:
+            rest = [i for i in range(n) if a_is_not_phase(legal_actions[i])]
+            return rest[:MAX_ACTIONS - len(phases)] + phases
+    return list(range(MAX_ACTIONS))
+
+
+def a_is_not_phase(action):
+    return action.phase == ActionPhase.none
 
 
 def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
@@ -1210,7 +1339,8 @@ def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
     cards, spec_infos = encode_cards(input.cards)
     global_ = encode_global(input.global_, input.cards)
     preset_ids = [0 if a.hint else a.card_id for a in legal_actions]
-    actions = encode_legal_actions(legal_actions, spec_infos)
+    enc = encoded_positions(legal_actions, input.action_msg.data.msg_type)
+    actions = encode_legal_actions([legal_actions[i] for i in enc], spec_infos)
     h_actions = state.history_actions.encode(input.global_.turn)
     model_input = {
         "cards_": cards,
@@ -1247,7 +1377,11 @@ def predict(model_fn, input: Input, prev_action_idx, state: PredictState):
         state.last_model = True
         rstate, probs, value = model_fn(state.rstate, model_input)
         state.rstate = rstate
-        probs = revert_pad_truncate(probs, n_actions)
+        # one probability per legal action, -1 for the ones the model didn't see
+        model_probs = probs
+        probs = [-1] * n_actions
+        for k, i in enumerate(enc):
+            probs[i] = model_probs[k] if k < len(model_probs) else -1
         assert len(probs) == n_actions
         probs, responses, can_finish = add_skipped_back(probs, legal_actions, input.action_msg)
         win_rate = (value + 1) / 2

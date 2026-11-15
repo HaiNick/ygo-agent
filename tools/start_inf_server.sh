@@ -10,6 +10,7 @@
 #   CARDS_DB        cards.cdb for card-name declarations (default: assets/locale/en/cards.cdb)
 #   ANNOUNCE_POOL   deck files or folders (':'-separated) that rank declaration candidates,
 #                   the decks the env loads in training (default: ~/ygo/decks/train)
+#   OBS_VERSION     observation version the checkpoint was trained on, 1 or 2 (default: 1)
 #   HOST            bind host (default: 127.0.0.1)
 #   PORT            bind port (default: 3000)
 set -euo pipefail
@@ -40,6 +41,7 @@ export CODE_LIST="${CODE_LIST:-$REPO/scripts/code_list.txt}"
 export NUM_EMBEDDINGS="${NUM_EMBEDDINGS:-15017}"
 export CARDS_DB="${CARDS_DB:-$REPO/assets/locale/en/cards.cdb}"
 export ANNOUNCE_POOL="${ANNOUNCE_POOL:-$HOME/ygo/decks/train}"
+export OBS_VERSION="${OBS_VERSION:-1}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-3000}"
 
@@ -53,6 +55,7 @@ echo "  CODE_LIST=$CODE_LIST"
 echo "  NUM_EMBEDDINGS=$NUM_EMBEDDINGS"
 echo "  CARDS_DB=$CARDS_DB"
 echo "  ANNOUNCE_POOL=$ANNOUNCE_POOL"
+echo "  OBS_VERSION=$OBS_VERSION"
 
 cd "$REPO/ygoinf"
 exec uvicorn ygoinf.server:app --host "$HOST" --port "$PORT"

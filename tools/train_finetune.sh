@@ -14,6 +14,8 @@
 #        NUM_EMBEDDINGS (15017), SAVE_INTERVAL (50),
 #        XLA_MEM_FRACTION (unset = JAX default 0.75; e.g. 0.65 leaves room for eval),
 #        TB_OFFSET (0; previous run's global step so curves and checkpoint names continue),
+#        OBS_VERSION (1; 2 trains on observation version 2, docs/OBS_V2.md. INIT must then be a
+#        checkpoint prepared with tools/obs_v2_ckpt.py or one trained on version 2),
 #        EXTRA (extra cleanba.py args)
 #   Optimizer (Adam) state is not saved in checkpoints, so every (re)start from
 #   one begins with fresh optimizer moments.
@@ -39,6 +41,7 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
 TB_OFFSET="${TB_OFFSET:-0}"
 XLA_MEM_FRACTION="${XLA_MEM_FRACTION:-}"
 EXTRA="${EXTRA:-}"
+OBS_VERSION="${OBS_VERSION:-1}"
 # Actor layout. envs x threads x steps = samples per update (64 x 2 x 32 = 4096,
 # the same as the old 16 x 2 x 128). The model call costs the same for 64 envs
 # as for 16, so this layout measured +58% SPS (docs/AUDIT.md, P1). NUM_STEPS is
@@ -69,6 +72,9 @@ ARGS=(
   --save_interval "$SAVE_INTERVAL" --local_eval_episodes 32 --eval_interval 50 --seed "$SEED"
   --num_embeddings "$NEMB" --freeze_id True
   --ckpt_dir "$DIR/checkpoints" --n_saved 0 --tb_dir "$DIR/tb")
+# version 1 keeps the argument list it always had; tools/ygo.sh eval reads the
+# version of a run from cmd_args
+[[ "$OBS_VERSION" != 1 ]] && ARGS+=(--obs_version "$OBS_VERSION")
 # shellcheck disable=SC2206
 ARGS+=($EXTRA)
 printf '%s\n' "${ARGS[@]}" > "$DIR/cmd_args"
@@ -81,6 +87,7 @@ echo "$TB_OFFSET" > "$DIR/tb_offset"
   echo "commit: $(cd "$REPO" && git rev-parse --short HEAD)$(cd "$REPO" && git diff --quiet || echo ' (dirty)')"
   echo "init: $INIT"
   echo "tb_offset: $TB_OFFSET"
+  echo "obs_version: $OBS_VERSION"
   echo "XLA_PYTHON_CLIENT_MEM_FRACTION: ${XLA_MEM_FRACTION:-default}"
   echo "decks: $DECK_DIR ($(ls "$DECK_DIR"/*.ydk | wc -l) files)"
   echo "cmd: cd $REPO/scripts && python -u cleanba.py ${ARGS[*]} --checkpoint <init or newest> --tb_offset <offset>"

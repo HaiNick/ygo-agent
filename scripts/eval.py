@@ -36,6 +36,8 @@ class Args:
     """the maximum number of options"""
     n_history_actions: int = 32
     """the number of history actions to use"""
+    obs_version: int = 1
+    """the observation version of the env (docs/OBS_V2.md)"""
     num_embeddings: Optional[int] = None
     """the number of embeddings of the agent"""
 
@@ -124,6 +126,7 @@ if __name__ == "__main__":
         async_reset=False,
         verbose=args.verbose,
         record=args.record,
+        obs_version=args.obs_version,
     )
     obs_space = envs.observation_space
     envs.num_envs = num_envs

@@ -13,6 +13,9 @@
 #        QUICK=1  only the quick-check subset: the base deck plus three new
 #                 archetypes (Artmage_PowerPatron, Blitzclique_A, Elfnote_KewlTune)
 #        ONLY="DeckA DeckB"  only these decks (file names without .ydk)
+#        OBS_VERSION1, OBS_VERSION2  observation version (docs/OBS_V2.md) the candidate and the
+#                 baseline were trained on (default 1 and 1). Each agent gets its own version in
+#                 the same game, so a version 2 model can play a version 1 model.
 #   For use while training runs: XLA_PYTHON_CLIENT_PREALLOCATE=false
 set -euo pipefail
 
@@ -25,6 +28,11 @@ cn="$(basename "$CKPT" .flax_model)"; bn="$(basename "$BASE" .flax_model)"
 OUT="$(realpath -m "${5:-$HOME/ygo/evals/${cn}_vs_${bn}.md}")"
 N_GAMES="${N_GAMES:-128}"
 SEED="${SEED:-0}"
+OBS1="${OBS_VERSION1:-1}"
+OBS2="${OBS_VERSION2:-1}"
+# with both on version 1 the battle.py command is the one it always was
+OBS_ARGS=()
+[[ "$OBS1" != 1 || "$OBS2" != 1 ]] && OBS_ARGS=(--obs_version1 "$OBS1" --obs_version2 "$OBS2")
 QUICK_DECKS="00_Base_Branded-Despia Artmage_PowerPatron Blitzclique_A Elfnote_KewlTune"
 ONLY="${ONLY:-}"
 [[ "${QUICK:-0}" == 1 && -z "$ONLY" ]] && ONLY="$QUICK_DECKS"
@@ -51,7 +59,7 @@ for f in "${decks[@]}"; do
   name="$(basename "$f" .ydk)"
   log="$LOGDIR/$name.log"
   python battle.py --deck "$f" --checkpoint1 "$CKPT" --checkpoint2 "$BASE" --num_embeddings "$NEMB" \
-    --num_episodes "$N_GAMES" --seed "$SEED" > "$log" 2>&1 || true
+    --num_episodes "$N_GAMES" --seed "$SEED" "${OBS_ARGS[@]}" > "$log" 2>&1 || true
   row=$(python3 - "$log" "$name" <<'EOF'
 import re, sys
 s, name = open(sys.argv[1]).read(), sys.argv[2]
@@ -76,6 +84,7 @@ mkdir -p "$(dirname "$OUT")"
   echo "- Candidate (agent1): \`$CKPT\`"
   echo "- Baseline (agent2): \`$BASE\`"
   echo "- \`--num_embeddings $NEMB\`, $N_GAMES games per deck (half with each seat), seed $SEED, greedy actions"
+  [[ ${#OBS_ARGS[@]} -gt 0 ]] && echo "- Observation version: candidate $OBS1, baseline $OBS2"
   [[ -n "$ONLY" ]] && echo "- Deck subset: $ONLY"
   echo "- Engine/env commit: \`$(cd "$REPO" && git rev-parse --short HEAD)\`, date $(date -u +%Y-%m-%d)"
   echo

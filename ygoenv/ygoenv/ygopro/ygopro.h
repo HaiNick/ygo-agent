@@ -786,6 +786,8 @@ static const std::vector<int> _msgs = {
     MSG_SELECT_OPTION,   MSG_SELECT_PLACE,     MSG_SELECT_SUM,
     MSG_SELECT_DISFIELD, MSG_ANNOUNCE_ATTRIB,  MSG_ANNOUNCE_NUMBER,
     MSG_ANNOUNCE_CARD,
+    // observation version 2 only (G2), appended so that ids 1 to 16 stay
+    MSG_SORT_CARD,
 };
 
 static const ankerl::unordered_dense::map<int, uint8_t> msg2id =
@@ -1859,7 +1861,21 @@ public:
                     "max_cards"_.Bind(80), "n_history_actions"_.Bind(16),
                     "record"_.Bind(false), "async_reset"_.Bind(false),
                     "greedy_reward"_.Bind(true), "timeout"_.Bind(600),
-                    "oppo_info"_.Bind(false), "max_steps"_.Bind(1000));
+                    "oppo_info"_.Bind(false), "max_steps"_.Bind(1000),
+                    // Observation version, see docs/OBS_V2.md. 1 is the
+                    // observation every checkpoint up to ft_r4 was trained
+                    // on and must stay bit-identical.
+                    "obs_version"_.Bind(1),
+                    // Per-seat versions, for evaluating a model of one
+                    // version against a model of the other (battle.py):
+                    // obs_version is player 0's version, obs_version2
+                    // player 1's (0 = the same). Envs with an id of at
+                    // least obs_version_swap_from (-1 = none) start with the
+                    // two swapped. With obs_version_alternate every env
+                    // swaps them at each new duel after its first.
+                    "obs_version2"_.Bind(0),
+                    "obs_version_swap_from"_.Bind(-1),
+                    "obs_version_alternate"_.Bind(false));
   }
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
@@ -1931,6 +1947,11 @@ public:
   void set_crash_slot(int slot, int env_id) {
     crash_slot_ = slot;
     crash_env_id_ = env_id;
+    // per-seat observation versions: this env starts with the seats swapped
+    int swap_from = spec_.config["obs_version_swap_from"_];
+    if (swap_from >= 0 && env_id >= swap_from) {
+      std::swap(obs_version_[0], obs_version_[1]);
+    }
   }
 
 protected:
@@ -1994,6 +2015,9 @@ protected:
   byte data_[SIZE_MESSAGE_BUFFER];  // the core's own limit (was 4096)
   int dp_ = 0;
   int dl_ = 0;
+  // End of the message being handled when every message is processed
+  // (process_all_messages), else -1.
+  int msg_end_ = -1;
 
   // query_field_card has no size limit: about 60 bytes per card plus overlay
   // and counter lists. 4096 overflowed at 69 cards in one location.
@@ -2023,10 +2047,31 @@ protected:
   std::unordered_map<uint32_t, std::vector<CardCode>> confirmed_locs_;
   // current selection: spec -> code for confirmed cards the observation has no slot for
   std::unordered_map<std::string, CardCode> confirmed_spec_codes_;
+  // Version 2 (docs/OBS_V2.md, C1): what each seat was shown. Version 1 keeps
+  // one set for both seats (revealed_, seen_codes_, confirmed_locs_), filled
+  // whoever sees the cards. A ygopro server sends MSG_CONFIRM_CARDS for deck
+  // cards only to the player in its first byte, and every other confirmation
+  // to both players. SeatView follows that rule (seat_receives_confirm).
+  struct SeatView {
+    // cards shown to this seat since the last MSG_CHAIN_SOLVED:
+    // (controller << 16 | location << 8 | sequence) -> code
+    std::unordered_map<uint32_t, CardCode> known;
+    // seen_codes_ as this seat knows them
+    std::vector<CardCode> seen[2];
+    // confirmed_locs_ as this seat knows them
+    std::unordered_map<uint32_t, std::vector<CardCode>> confirmed_locs;
+  };
+  SeatView views_[2];
+  // Version 2, current decision: spec -> code for action cards in the deciding
+  // player's own deck. In card selections the core numbers such candidates
+  // 0, 1, 2, ... (card::get_select_sequence) instead of giving their sequence,
+  // so the spec doesn't name the card's row. The row is found by this code.
+  std::unordered_map<std::string, CardCode> deck_spec_codes_;
 
   // multi select
   int ms_idx_ = -1;
-  int ms_mode_ = 0;
+  int ms_mode_ = 0;  // 0: picks, 1: combinations (select_sum), 2: order (sort_card, version 2)
+  int sort_resp_len_ = 1;
   int ms_min_ = 0;
   int ms_max_ = 0;
   int ms_must_ = 0;
@@ -2053,6 +2098,10 @@ protected:
 
   // MSG_SELECT_COUNTER
   int n_counters_ = 0;
+
+  // Observation version per seat (config obs_version). Everything that
+  // differs from version 1 asks obs_v2(player) for the player it concerns.
+  int obs_version_[2] = {1, 1};
 
   std::mt19937 gen_;
 
@@ -2084,6 +2133,17 @@ public:
     gen_ = std::mt19937(env_seed);
     duel_gen_ = std::mt19937(dist_int_(gen_));
 
+    int obs_version = spec.config["obs_version"_];
+    if (obs_version != 1 && obs_version != 2) {
+      throw std::runtime_error(fmt::format("Unknown obs_version {}", obs_version));
+    }
+    int obs_version2 = spec.config["obs_version2"_];
+    if (obs_version2 != 0 && obs_version2 != 1 && obs_version2 != 2) {
+      throw std::runtime_error(fmt::format("Unknown obs_version2 {}", obs_version2));
+    }
+    obs_version_[0] = obs_version;
+    obs_version_[1] = obs_version2 == 0 ? obs_version : obs_version2;
+
     int max_options = spec.config["max_options"_];
     int n_action_feats = spec.state_spec["obs:actions_"_].shape[1];
     history_actions_1_ = TArray<uint8_t>(Array(
@@ -2093,6 +2153,19 @@ public:
   }
 
   int max_options() const { return spec_.config["max_options"_]; }
+
+  // true if this seat gets observation version 2
+  bool obs_v2(PlayerId player) const { return obs_version_[player & 1] >= 2; }
+
+  // Version 1 drops the rest of a core buffer after a message whose handler
+  // skips its payload (C12). With a version 2 seat in the duel every message
+  // is processed (docs/OBS_V2.md, F1). This is per duel, not per seat: the
+  // tracking that messages feed (LP, turn, phase, seen codes) is shared.
+  bool process_all_messages() const { return obs_v2(0) || obs_v2(1); }
+
+  // A handler that doesn't read its payload: go to the end of this message
+  // (process_all_messages) or, as before, to the end of the buffer.
+  void skip_msg() { dp_ = msg_end_ >= 0 ? msg_end_ : dl_; }
 
   int max_cards() const { return spec_.config["max_cards"_]; }
 
@@ -2159,12 +2232,24 @@ public:
       }
     }
 
+    if (spec_.config["obs_version_alternate"_] && episode_count_ > 0) {
+      // battle.py switches the two agents' seats of an env at each new game
+      std::swap(obs_version_[0], obs_version_[1]);
+    }
+
     turn_count_ = 0;
     ms_idx_ = -1;
     seen_codes_[0].clear();
     seen_codes_[1].clear();
     confirmed_locs_.clear();
     confirmed_spec_codes_.clear();
+    deck_spec_codes_.clear();
+    for (auto &v : views_) {
+      v.known.clear();
+      v.seen[0].clear();
+      v.seen[1].clear();
+      v.confirmed_locs.clear();
+    }
 
     history_actions_1_.Zero();
     history_actions_2_.Zero();
@@ -2312,7 +2397,7 @@ public:
       ms_spec2idx_[spec] = j;
     }
 
-    if (ms_mode_ == 0) {
+    if (ms_mode_ != 1) {
       for (int j = 0; j < ms_specs_.size(); ++j) {
         const auto &spec = ms_specs_[j];
         legal_actions_.push_back(LegalAction::from_spec(spec));
@@ -2325,7 +2410,7 @@ public:
 
   void handle_multi_select() {
     legal_actions_.clear();
-    if (ms_mode_ == 0) {
+    if (ms_mode_ != 1) {
       for (int j = 0; j < ms_specs_.size(); ++j) {
         if (ms_spec2idx_.find(ms_specs_[j]) != ms_spec2idx_.end()) {
           legal_actions_.push_back(
@@ -2448,6 +2533,11 @@ public:
         }
         fmt::println("specs: {}, idx: {}, spec: {}", specs, idx, action.spec_);
         ms_idx_ = -1;
+        if (ms_mode_ == 2) {
+          resp_buf_[0] = 255;  // sort_card: default order
+          YGO_SetResponseb(pduel_, resp_buf_);
+          return;
+        }
         resp_buf_[0] = ms_min_;
         for (int i = 0; i < ms_min_; ++i) {
           resp_buf_[i + 1] = i;
@@ -2456,7 +2546,27 @@ public:
         return;
       }
     }
-    if (finish) {
+    if (finish && ms_mode_ == 2) {
+      // MSG_SORT_CARD (version 2): the answer is the place of every card,
+      // 0 = on top. The k-th pick gets place k, the card that is left the
+      // last place.
+      ms_idx_ = -1;
+      int n = ms_specs_.size();
+      std::vector<char> picked(n, 0);
+      for (int k = 0; k < static_cast<int>(ms_r_idxs_.size()); ++k) {
+        resp_buf_[ms_r_idxs_[k]] = k;
+        picked[ms_r_idxs_[k]] = 1;
+      }
+      int place = ms_r_idxs_.size();
+      for (int i = 0; i < n; ++i) {
+        if (!picked[i]) {
+          resp_buf_[i] = place++;
+        }
+      }
+      sort_resp_len_ = n;
+      YGO_SetResponseb(pduel_, resp_buf_);
+      sort_resp_len_ = 1;
+    } else if (finish) {
       ms_idx_ = -1;
       resp_buf_[0] = ms_r_idxs_.size();
       for (int i = 0; i < ms_r_idxs_.size(); ++i) {
@@ -2695,7 +2805,9 @@ public:
       spec_infos = spec_infos_;
       loc_n_cards = loc_n_cards_;
     } else {
-      auto [spec_infos_, loc_n_cards_] = _set_obs_cards(state["obs:cards_"_], to_play_);
+      auto [spec_infos_, loc_n_cards_] = obs_v2(to_play_)
+          ? _set_obs_cards_v2(state["obs:cards_"_], to_play_)
+          : _set_obs_cards(state["obs:cards_"_], to_play_);
       spec_infos = spec_infos_;
       loc_n_cards = loc_n_cards_;
     }
@@ -2704,17 +2816,80 @@ public:
 
     // we can't shuffle because idx must be stable in callback
     if (n_options > max_options()) {
-      legal_actions_.resize(max_options());
+      if (obs_v2(to_play_) && (msg_ == MSG_SELECT_IDLECMD || msg_ == MSG_SELECT_BATTLECMD)) {
+        // Version 2 (docs/OBS_V2.md, D1): the phase changes are the last
+        // entries, so the cut removed them and the turn could not be ended.
+        // Keep the first max_options - n entries and append the n phase
+        // changes. The kept entries stay at their index, which the callbacks
+        // rely on.
+        std::vector<LegalAction> phases;
+        for (const auto &a : legal_actions_) {
+          if (a.phase_ != ActionPhase::None) {
+            phases.push_back(a);
+          }
+        }
+        legal_actions_.resize(max_options() - phases.size());
+        legal_actions_.insert(legal_actions_.end(), phases.begin(), phases.end());
+      } else {
+        legal_actions_.resize(max_options());
+      }
     }
 
     n_options = legal_actions_.size();
     state["info:num_options"_] = n_options;
+
+    // Version 2: an action card in the own deck is found by its code, not by
+    // the sequence in the message. Actions in order: each takes the first
+    // own-deck row with its code that no earlier action took, or the first
+    // such row if all are taken. Rows of equal cards are identical and the
+    // model has no positional encoding on the card rows, so any of them is
+    // right. ygoinf uses the same rule (resolve_own_deck).
+    std::vector<std::pair<int, CardId>> deck_rows;  // (row + 1, card id)
+    std::vector<char> deck_row_used;
+    const bool by_code = obs_v2(to_play_) && !deck_spec_codes_.empty();
+    if (by_code) {
+      for (int k = 1;; ++k) {
+        auto it = spec_infos.find(std::to_string(k));
+        if (it == spec_infos.end()) {
+          break;
+        }
+        deck_rows.emplace_back(it->second.index, it->second.cid);
+      }
+      deck_row_used.assign(deck_rows.size(), 0);
+    }
 
     for (int i = 0; i < n_options; ++i) {
       auto &action = legal_actions_[i];
       action.msg_ = msg_;
       const auto &spec = action.spec_;
       if (!spec.empty()) {
+        if (by_code) {
+          auto dc = deck_spec_codes_.find(spec);
+          auto id_it = dc != deck_spec_codes_.end() ? card_ids_.find(dc->second) : card_ids_.end();
+          int found = -1;
+          if (id_it != card_ids_.end()) {
+            for (int j = 0; j < static_cast<int>(deck_rows.size()); ++j) {
+              if (deck_rows[j].second != id_it->second) {
+                continue;
+              }
+              if (!deck_row_used[j]) {
+                found = j;
+                break;
+              }
+              if (found < 0) {
+                found = j;
+              }
+            }
+          }
+          if (found >= 0) {
+            deck_row_used[found] = 1;
+            action.spec_index_ = deck_rows[found].first;
+            if (action.cid_ == 0) {
+              action.cid_ = id_it->second;
+            }
+            continue;
+          }
+        }
         auto hint = confirmed_spec_codes_.find(spec);
         if (hint != confirmed_spec_codes_.end()) {
           // Card confirmed to this player this chain (e.g. opponent deck top):
@@ -2818,6 +2993,96 @@ private:
 
             spec_infos[spec] = {static_cast<uint16_t>(offset), card_id};
           }
+        }
+      }
+    }
+    return {spec_infos, loc_n_cards};
+  }
+
+  // Version 2: is this card of viewer's opponent visible to viewer?
+  // - an xyz material: yes (its position_ holds the overlay index)
+  // - a card this seat was shown since the last MSG_CHAIN_SOLVED, still in
+  //   that place with that code: yes
+  // - in the deck: otherwise no
+  // - anywhere else: if it isn't face-down. That includes face-up cards in
+  //   the extra deck and public cards in the hand.
+  bool opp_card_visible_v2(PlayerId viewer, const Card &c) const {
+    if (c.location_ & LOCATION_OVERLAY) {
+      return true;
+    }
+    const auto &known = views_[viewer].known;
+    auto it = known.find((static_cast<uint32_t>(c.controler_) << 16) |
+                         ((c.location_ & 0xff) << 8) | (c.sequence_ & 0xff));
+    if (it != known.end() && it->second == c.code_) {
+      return true;
+    }
+    if (c.location_ == LOCATION_DECK) {
+      return false;
+    }
+    return !(c.position_ & POS_FACEDOWN);
+  }
+
+  bool seat_knows_card_in(PlayerId viewer, PlayerId controller, uint8_t location) const {
+    for (const auto &kv : views_[viewer].known) {
+      if ((kv.first >> 16) == controller && ((kv.first >> 8) & 0xff) == location) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Observation version 2 of _set_obs_cards (docs/OBS_V2.md, B1 and C1).
+  // - Every row whose features are written also gets its card id in columns
+  //   0 and 1. Version 1 wrote id 0 everywhere (K1).
+  // - An opponent card has features if this seat can see it
+  //   (opp_card_visible_v2). Version 1 unhid the opponent's whole deck, hand
+  //   and extra deck while revealed_ was non-empty, whoever had been shown a
+  //   card, and tested the confirmed card with an inverted prefix.
+  // - An opponent card in the deck, hand or extra deck that this seat can't
+  //   see is a count-only row (location and owner), with no spec. Version 1
+  //   wrote such a row face-down while revealed_ was non-empty.
+  std::tuple<SpecInfos, std::vector<int>> _set_obs_cards_v2(TArray<uint8_t> &f_cards, PlayerId to_play) {
+    const int max_rows = max_cards() * 2;
+    SpecInfos spec_infos;
+    std::vector<int> loc_n_cards;
+    int offset = 0;
+    for (auto pi = 0; pi < 2; pi++) {
+      const PlayerId player = (to_play + pi) % 2;
+      const bool opponent = pi == 1;
+      for (uint8_t location : {LOCATION_DECK, LOCATION_HAND, LOCATION_MZONE, LOCATION_SZONE,
+                               LOCATION_GRAVE, LOCATION_REMOVED, LOCATION_EXTRA}) {
+        const bool hidden_zone = location == LOCATION_DECK || location == LOCATION_HAND ||
+                                 location == LOCATION_EXTRA;
+        // The opponent's deck is only queried when this seat was shown a
+        // card in it. Hand and extra deck can hold face-up cards.
+        if (opponent && location == LOCATION_DECK && !seat_knows_card_in(to_play, player, location)) {
+          auto n_cards = YGO_QueryFieldCount(pduel_, player, location);
+          loc_n_cards.push_back(n_cards);
+          for (auto i = 0; i < n_cards; i++) {
+            if (offset >= max_rows) break;
+            f_cards(offset, 2) = location_to_id(location);
+            f_cards(offset, 4) = 1;
+            offset++;
+          }
+          continue;
+        }
+        std::vector<Card> cards = get_cards_in_location(player, location);
+        int n_cards = cards.size();
+        loc_n_cards.push_back(n_cards);
+        for (int i = 0; i < n_cards; ++i) {
+          const auto &c = cards[i];
+          const bool hide = opponent && !opp_card_visible_v2(to_play, c);
+          if (offset >= max_rows) break;
+          if (hide && hidden_zone) {
+            f_cards(offset, 2) = location_to_id(location);
+            f_cards(offset, 4) = 1;
+            offset++;
+            continue;
+          }
+          CardId card_id = hide ? 0 : c_get_card_id(c.code_);
+          _set_obs_card_(f_cards, offset, c, hide, card_id);
+          offset++;
+          spec_infos[c.get_spec(opponent)] = {static_cast<uint16_t>(offset), card_id};
         }
       }
     }
@@ -2950,7 +3215,12 @@ private:
       // The model's level embedding has 14 rows (0-13). An index outside it
       // makes Flax return NaN for the whole observation, so clamp like ygoinf.
       f_cards(offset, 9) = std::min<uint32_t>(c.level_, 13);
-      f_cards(offset, 10) = std::min(c.counter_, static_cast<uint32_t>(15));
+      // counter_ is the query word of the first counter type: type | count << 16.
+      // Version 1 clamps the whole word, so the feature is 15 for any card
+      // with counters (C11). Version 2 writes the count.
+      f_cards(offset, 10) = obs_v2(to_play_)
+          ? std::min(c.counter_ >> 16, static_cast<uint32_t>(15))
+          : std::min(c.counter_, static_cast<uint32_t>(15));
       f_cards(offset, 11) = static_cast<uint8_t>((c.status_ & (STATUS_DISABLED | STATUS_FORBIDDEN)) != 0);
       auto [atk1, atk2] = float_transform(c.attack_);
       f_cards(offset, 12) = atk1;
@@ -3127,7 +3397,8 @@ private:
     _set_obs_action_msg(feat, i, msg);
     _set_obs_action_card_id(feat, i, action.cid_);
     if (msg == MSG_SELECT_CARD || msg == MSG_SELECT_TRIBUTE ||
-        msg == MSG_SELECT_SUM || msg == MSG_SELECT_UNSELECT_CARD) {
+        msg == MSG_SELECT_SUM || msg == MSG_SELECT_UNSELECT_CARD ||
+        msg == MSG_SORT_CARD) {
       if (action.finish_) {
         _set_obs_action_finish(feat, i);
       } else {
@@ -3172,6 +3443,17 @@ private:
       offset++;
     }
     auto [loc, seq, pos] = spec_to_ls(spec.substr(offset));
+    if (opponent && obs_v2(1 - player)) {
+      // version 2: 0 for a card the observation shows as a count only
+      if (loc == LOCATION_DECK || loc == LOCATION_HAND || loc == LOCATION_EXTRA) {
+        Card c = get_card(player, loc, seq);
+        c.controler_ = player;
+        if (!opp_card_visible_v2(1 - player, c)) {
+          return 0;
+        }
+      }
+      return c_get_card_id(get_card_code(player, loc, seq));
+    }
     if (opponent) {
       bool hidden_for_opponent = true;
       if (
@@ -3360,8 +3642,9 @@ private:
     if (record_ && is_recording) {
       switch (msg_) {
         case MSG_SORT_CARD:
-          ReplayWriteInt8(1);
-          ReplayWriteData(buf, 1);
+          // 1 byte (255 = default order), or one place per card (version 2)
+          ReplayWriteInt8(sort_resp_len_);
+          ReplayWriteData(buf, sort_resp_len_);
           break;
         case MSG_SELECT_COUNTER:
           ReplayWriteInt8(2 * n_counters_);
@@ -3468,7 +3751,14 @@ private:
             auto la = legal_actions_[0];
             la.msg_ = msg_;
             if (la.cid_ == 0 && !la.spec_.empty()) {
-              la.cid_ = spec_to_card_id(la.spec_, to_play_);
+              auto dc = deck_spec_codes_.find(la.spec_);
+              auto id_it = dc != deck_spec_codes_.end() ? card_ids_.find(dc->second) : card_ids_.end();
+              if (id_it != card_ids_.end()) {
+                // version 2, own deck card: the id of the code in the message
+                la.cid_ = id_it->second;
+              } else {
+                la.cid_ = spec_to_card_id(la.spec_, to_play_);
+              }
             }
             update_history_actions(to_play_, la);
             if (verbose_) {
@@ -3703,6 +3993,7 @@ private:
         }
       }
       card_specs.push_back({code, ls_to_spec(loc, seq, 0, player != controller), data});
+      note_own_deck_spec(player, controller, loc, std::get<1>(card_specs.back()), code);
     }
     return card_specs;
   }
@@ -3739,11 +4030,7 @@ private:
   // 1. read msg_ from data_ and update dp_
   // 2. (optional) print information if verbose_ is true
   // 3. update to_play_ and options_ if need action
-  void note_seen(uint32_t player, CardCode code) {
-    if (player > 1 || code == 0) {
-      return;
-    }
-    auto &v = seen_codes_[player];
+  static void note_seen_in(std::vector<CardCode> &v, CardCode code) {
     auto it = std::find(v.begin(), v.end(), code);
     if (it != v.end()) {
       v.erase(it);
@@ -3751,18 +4038,39 @@ private:
     v.push_back(code);
   }
 
+  // a code made public to both players
+  void note_seen(uint32_t player, CardCode code) {
+    if (player > 1 || code == 0) {
+      return;
+    }
+    note_seen_in(seen_codes_[player], code);
+    note_seen_in(views_[0].seen[player], code);
+    note_seen_in(views_[1].seen[player], code);
+  }
+
   // Opponent deck cards are not part of the card observation; if a selection
   // offers one that was confirmed this chain, remember its code for the action.
-  void note_confirmed_spec(uint32_t c, uint32_t loc, uint32_t seq,
+  void note_confirmed_spec(PlayerId player, uint32_t c, uint32_t loc, uint32_t seq,
                            const std::string &spec, CardCode code) {
     if (loc != LOCATION_DECK && loc != LOCATION_EXTRA) {
       return;
     }
     (void)seq;
-    auto it = confirmed_locs_.find((c << 8) | loc);
-    if (it != confirmed_locs_.end() &&
+    // version 2: only what was confirmed to the selecting player
+    const auto &locs = obs_v2(player) ? views_[player].confirmed_locs : confirmed_locs_;
+    auto it = locs.find((c << 8) | loc);
+    if (it != locs.end() &&
         std::find(it->second.begin(), it->second.end(), code) != it->second.end()) {
       confirmed_spec_codes_[spec] = code;
+    }
+  }
+
+  // Version 2: remember the code of an action card in the deciding player's
+  // own deck (see deck_spec_codes_).
+  void note_own_deck_spec(PlayerId player, uint32_t controller, uint32_t loc,
+                          const std::string &spec, CardCode code) {
+    if (obs_v2(player) && controller == player && loc == LOCATION_DECK) {
+      deck_spec_codes_[spec] = code & 0x7fffffff;
     }
   }
 
@@ -3810,11 +4118,33 @@ private:
       if (!avail(off + 1)) break;
       int n = data_[dp_ + off];
       off += 1;
+      // A ygopro server sends a MSG_CONFIRM_CARDS whose first card is in the
+      // deck only to the player in byte 0. Everything else goes to both.
+      bool receives[2] = {true, true};
+      if (msg_ == MSG_CONFIRM_CARDS && n > 0 && avail(off + 7) &&
+          data_[dp_ + off + 5] == LOCATION_DECK) {
+        uint32_t viewer = data_[dp_];
+        receives[0] = viewer == 0;
+        receives[1] = viewer == 1;
+      }
       for (int i = 0; i < n && avail(off + 7); ++i, off += 7) {
         uint32_t c = data_[dp_ + off + 4], l = data_[dp_ + off + 5], q = data_[dp_ + off + 6];
-        note_seen(c, peek_u32(off));
-        (void)q;
-        confirmed_locs_[(c << 8) | l].push_back(peek_u32(off));
+        CardCode code = peek_u32(off);
+        if (c <= 1 && code != 0) {
+          note_seen_in(seen_codes_[c], code);
+        }
+        confirmed_locs_[(c << 8) | l].push_back(code);
+        for (int seat = 0; seat < 2; ++seat) {
+          if (!receives[seat]) {
+            continue;
+          }
+          auto &v = views_[seat];
+          if (c <= 1 && code != 0) {
+            note_seen_in(v.seen[c], code);
+          }
+          v.confirmed_locs[(c << 8) | l].push_back(code);
+          v.known[(c << 16) | (l << 8) | q] = code;
+        }
       }
       break;
     }
@@ -3854,11 +4184,14 @@ private:
         try_add(opcodes[i - 1]);
       }
     }
-    const auto &oppo_seen = seen_codes_[1 - player];
+    // version 2: the codes this player has seen (not the other seat's
+    // private looks at its deck)
+    const auto *seen = obs_v2(player) ? views_[player].seen : seen_codes_;
+    const auto &oppo_seen = seen[1 - player];
     for (auto it = oppo_seen.rbegin(); it != oppo_seen.rend(); ++it) {
       try_add(*it);
     }
-    const auto &own_seen = seen_codes_[player];
+    const auto &own_seen = seen[player];
     for (auto it = own_seen.rbegin(); it != own_seen.rend(); ++it) {
       try_add(*it);
     }
@@ -3893,10 +4226,164 @@ private:
     return out;
   }
 
+  // Payload length of message msg at data_[p] (the byte after the message
+  // id), or -1 if it is unknown or runs past the buffer. Port of the table in
+  // tests/yrp_verify.cpp and tools/ygoinf_parity.py (msg_len), which follows
+  // the reference client's ReplayAnalyze. Left out: messages that core 0.0.3
+  // doesn't define (REFRESH_DECK, CARD_SELECTED, UNEQUIP) and the two the env
+  // has no handler for anyway (TAG_SWAP, RELOAD_FIELD).
+  int msg_payload_len(int msg, int p) const {
+    bool ok = true;
+    auto u8 = [&](int o) -> int {
+      if (p + o >= dl_) {
+        ok = false;
+        return 0;
+      }
+      return data_[p + o];
+    };
+    int len = -1;
+    switch (msg) {
+    case MSG_RETRY: len = 0; break;
+    case MSG_HINT: len = 6; break;
+    case MSG_WIN: len = 2; break;
+    case MSG_SELECT_EFFECTYN: len = 13; break;
+    case MSG_SELECT_YESNO: len = 5; break;
+    case MSG_SELECT_PLACE:
+    case MSG_SELECT_DISFIELD:
+    case MSG_SELECT_POSITION: len = 6; break;
+    case MSG_SHUFFLE_DECK:
+    case MSG_SWAP_GRAVE_DECK: len = 1; break;
+    case MSG_REVERSE_DECK: len = 0; break;
+    case MSG_DECK_TOP: len = 6; break;
+    case MSG_NEW_TURN: len = 1; break;
+    case MSG_NEW_PHASE: len = 2; break;
+    case MSG_MOVE: len = 16; break;
+    case MSG_POS_CHANGE: len = 9; break;
+    case MSG_SET: len = 8; break;
+    case MSG_SWAP: len = 16; break;
+    case MSG_FIELD_DISABLED: len = 4; break;
+    case MSG_SUMMONING:
+    case MSG_SPSUMMONING:
+    case MSG_FLIPSUMMONING: len = 8; break;
+    case MSG_SUMMONED:
+    case MSG_SPSUMMONED:
+    case MSG_FLIPSUMMONED: len = 0; break;
+    case MSG_CHAINING: len = 16; break;
+    case MSG_CHAINED:
+    case MSG_CHAIN_SOLVING:
+    case MSG_CHAIN_SOLVED:
+    case MSG_CHAIN_NEGATED:
+    case MSG_CHAIN_DISABLED: len = 1; break;
+    case MSG_CHAIN_END: len = 0; break;
+    case MSG_DAMAGE:
+    case MSG_RECOVER:
+    case MSG_LPUPDATE:
+    case MSG_PAY_LPCOST: len = 5; break;
+    case MSG_EQUIP: len = 8; break;
+    case MSG_CARD_TARGET:
+    case MSG_CANCEL_TARGET: len = 8; break;
+    case MSG_ADD_COUNTER:
+    case MSG_REMOVE_COUNTER: len = 7; break;
+    case MSG_ATTACK: len = 8; break;
+    case MSG_BATTLE: len = 26; break;
+    case MSG_ATTACK_DISABLED:
+    case MSG_DAMAGE_STEP_START:
+    case MSG_DAMAGE_STEP_END: len = 0; break;
+    case MSG_MISSED_EFFECT: len = 8; break;
+    case MSG_ROCK_PAPER_SCISSORS:
+    case MSG_HAND_RES: len = 1; break;
+    case MSG_ANNOUNCE_RACE:
+    case MSG_ANNOUNCE_ATTRIB: len = 6; break;
+    case MSG_CARD_HINT: len = 9; break;
+    case MSG_PLAYER_HINT: len = 6; break;
+    case MSG_MATCH_KILL: len = 4; break;
+    case MSG_SELECT_BATTLECMD: {
+      int o = 2 + u8(1) * 11;
+      len = o + 1 + u8(o) * 8 + 2;
+      break;
+    }
+    case MSG_SELECT_IDLECMD: {
+      int o = 1;
+      for (int i = 0; i < 5; ++i) {
+        o += 1 + u8(o) * 7;
+      }
+      len = o + 1 + u8(o) * 11 + 3;
+      break;
+    }
+    case MSG_SELECT_OPTION: len = 2 + u8(1) * 4; break;
+    case MSG_SELECT_CARD:
+    case MSG_SELECT_TRIBUTE: len = 5 + u8(4) * 8; break;
+    case MSG_SELECT_UNSELECT_CARD: {
+      int o = 6 + u8(5) * 8;
+      len = o + 1 + u8(o) * 8;
+      break;
+    }
+    case MSG_SELECT_CHAIN: len = 11 + u8(1) * 14; break;
+    case MSG_SELECT_COUNTER: len = 6 + u8(5) * 9; break;
+    case MSG_SELECT_SUM: {
+      int o = 8 + u8(8) * 11 + 1;
+      len = o + 1 + u8(o) * 11;
+      break;
+    }
+    case MSG_SORT_CARD:
+    case MSG_CONFIRM_DECKTOP:
+    case MSG_CONFIRM_EXTRATOP: len = 2 + u8(1) * 7; break;
+    case MSG_CONFIRM_CARDS: len = 3 + u8(2) * 7; break;
+    case MSG_SHUFFLE_HAND:
+    case MSG_SHUFFLE_EXTRA: len = 2 + u8(1) * 4; break;
+    case MSG_SHUFFLE_SET_CARD: len = 2 + u8(1) * 8; break;
+    case MSG_RANDOM_SELECTED: len = 2 + u8(1) * 4; break;
+    case MSG_BECOME_TARGET: len = 1 + u8(0) * 4; break;
+    case MSG_DRAW: len = 2 + u8(1) * 4; break;
+    case MSG_TOSS_COIN:
+    case MSG_TOSS_DICE: len = 2 + u8(1); break;
+    case MSG_ANNOUNCE_CARD:
+    case MSG_ANNOUNCE_NUMBER: len = 2 + u8(1) * 4; break;
+    case MSG_AI_NAME:
+    case MSG_SHOW_HINT: len = 2 + (u8(0) | (u8(1) << 8)) + 1; break;
+    default: len = -1; break;
+    }
+    if (!ok || len < 0 || p + len > dl_) {
+      return -1;
+    }
+    return len;
+  }
+
   void handle_message() {
+    msg_end_ = -1;
+    if (process_all_messages()) {
+      int msg = data_[dp_];
+      int len = msg_payload_len(msg, dp_ + 1);
+      if (len < 0) {
+        show_buffer();
+        throw std::runtime_error(fmt::format(
+            "[handle_message] no length for message {} at {} of {} bytes",
+            msg_to_string(msg), dp_, dl_));
+      }
+      msg_end_ = dp_ + 1 + len;
+    }
+    handle_message_();
+    if (msg_end_ >= 0) {
+      // Every handler either reads its payload or calls skip_msg(). A
+      // position past the end, or (outside verbose mode, where some handlers
+      // print without reading everything) before it, means the length table
+      // and the handler disagree. Stop instead of parsing garbage.
+      if (dp_ > msg_end_ || (dp_ < msg_end_ && !verbose_)) {
+        show_buffer();
+        throw std::runtime_error(fmt::format(
+            "[handle_message] message {} ends at {}, the handler stopped at {}",
+            msg_to_string(msg_), msg_end_, dp_));
+      }
+      dp_ = msg_end_;
+      msg_end_ = -1;
+    }
+  }
+
+  void handle_message_() {
     msg_ = int(data_[dp_++]);
     legal_actions_ = {};
     confirmed_spec_codes_.clear();  // hints belong to one decision
+    deck_spec_codes_.clear();
     track_seen_codes();
 
     if (verbose_) {
@@ -3905,7 +4392,7 @@ private:
 
     if (msg_ == MSG_DRAW) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -3946,7 +4433,7 @@ private:
       }
     } else if (msg_ == MSG_MOVE) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4069,7 +4556,7 @@ private:
       }
     } else if (msg_ == MSG_SWAP) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code1 = read_u32();
@@ -4093,7 +4580,7 @@ private:
       }
     } else if (msg_ == MSG_SET) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4110,7 +4597,7 @@ private:
                               card.get_position()));
     } else if (msg_ == MSG_EQUIP) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto c = read_u8();
@@ -4155,7 +4642,7 @@ private:
       }
     } else if (msg_ == MSG_CARD_HINT) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       uint8_t player = read_u8();
@@ -4191,7 +4678,7 @@ private:
       }
     } else if (msg_ == MSG_POS_CHANGE) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4212,7 +4699,7 @@ private:
                  ") changed from " + prevpos_str + " to " + pos_str + ".");
     } else if (msg_ == MSG_BECOME_TARGET) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto u = read_u8();
@@ -4232,7 +4719,7 @@ private:
       }
     } else if (msg_ == MSG_CONFIRM_DECKTOP) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4260,7 +4747,7 @@ private:
       }
     } else if (msg_ == MSG_RANDOM_SELECTED) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4296,14 +4783,14 @@ private:
       }
     } else if (msg_ == MSG_PLAYER_HINT) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       dp_ += 6;
       // TODO(3): implement output
     } else if (msg_ == MSG_CARD_TARGET) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto c1 = read_u8();
@@ -4359,7 +4846,7 @@ private:
       }
     } else if (msg_ == MSG_MISSED_EFFECT) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       dp_ += 4;
@@ -4372,10 +4859,38 @@ private:
         str = str.replace(str.find(fmt_str), fmt_str.length(), card.name_);
         players_[pl]->notify(str);
       }
+    } else if (msg_ == MSG_SORT_CARD && obs_v2(data_[dp_]) && data_[dp_ + 1] >= 2) {
+      // Version 2 (docs/OBS_V2.md, G2): the model orders the cards. The only
+      // sender is the core's deck sort (Duel.SortDecktop): "which of these
+      // cards goes on top next", one pick per card, as a card selection with
+      // its own message id. The last card needs no pick. Version 1, and a
+      // single card, keep the default order below.
+      auto player = read_u8();
+      auto size = read_u8();
+      std::vector<std::string> specs;
+      specs.reserve(size);
+      for (int i = 0; i < size; ++i) {
+        CardCode code = read_u32();
+        auto c = read_u8();
+        auto loc = read_u8();
+        auto seq = read_u8();
+        auto spec = ls_to_spec(loc, seq, 0, c != player);
+        specs.push_back(spec);
+        note_confirmed_spec(player, c, loc, seq, spec, code);
+        note_own_deck_spec(player, c, loc, spec, code);
+        if (verbose_) {
+          players_[player]->notify(fmt::format("{}: {}", i + 1, c_get_card(code).name_));
+        }
+      }
+      init_multi_select(size - 1, size - 1, 0, specs, 2);
+      to_play_ = player;
+      callback_ = [this](int idx) {
+        _callback_multi_select(idx, ms_max_ == 1);
+      };
     } else if (msg_ == MSG_SORT_CARD) {
       // TODO(3): implement action
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         resp_buf_[0] = 255;
         YGO_SetResponseb(pduel_, resp_buf_);
         return;
@@ -4434,7 +4949,7 @@ private:
       // };
     } else if (msg_ == MSG_ADD_COUNTER) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto ctype = read_u16();
@@ -4451,7 +4966,7 @@ private:
       op->notify(fmt::format("{} counter(s) of type {} placed on {} ().", count, "UNK", c.name_, c.get_spec(op_id)));
     } else if (msg_ == MSG_REMOVE_COUNTER) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto ctype = read_u16();
@@ -4467,7 +4982,7 @@ private:
       op->notify(fmt::format("{} counter(s) of type {} removed from {} ().", count, "UNK", c.name_, c.get_spec(op_id)));
     } else if (msg_ == MSG_ATTACK_DISABLED) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       for (PlayerId pl = 0; pl < 2; pl++) {
@@ -4475,14 +4990,14 @@ private:
       }
     } else if (msg_ == MSG_SHUFFLE_SET_CARD) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       // TODO(3): implement output
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_SHUFFLE_DECK) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4492,7 +5007,7 @@ private:
       op->notify(pl->nickname_ + " shuffled their deck.");
     } else if (msg_ == MSG_SHUFFLE_EXTRA) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto player = read_u8();
@@ -4506,22 +5021,22 @@ private:
       op->notify(fmt::format("{} shuffled their extra deck ({}).", pl->nickname_, count));
     } else if (msg_ == MSG_SHUFFLE_HAND) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
 
       auto player = read_u8();
-      dp_ = dl_;
+      skip_msg();
 
       auto& pl = players_[player];
       auto& op = players_[1 - player];
       pl->notify("You shuffled your hand.");
       op->notify(pl->nickname_ + " shuffled their hand.");
     } else if (msg_ == MSG_SUMMONED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_SUMMONING) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4535,12 +5050,12 @@ private:
                    card.get_position() + " position.");
       }
     } else if (msg_ == MSG_SPSUMMONED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_FLIPSUMMONED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_FLIPSUMMONING) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
 
@@ -4557,7 +5072,7 @@ private:
       }
     } else if (msg_ == MSG_SPSUMMONING) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4579,22 +5094,26 @@ private:
         }
       }
     } else if (msg_ == MSG_CHAIN_NEGATED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAIN_DISABLED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAIN_SOLVED) {
-      dp_ = dl_;
+      skip_msg();
       revealed_.clear();
       confirmed_locs_.clear();
+      for (auto &v : views_) {
+        v.known.clear();
+        v.confirmed_locs.clear();
+      }
     } else if (msg_ == MSG_CHAIN_SOLVING) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAINED) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAIN_END) {
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_CHAINING) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       CardCode code = read_u32();
@@ -4643,7 +5162,7 @@ private:
           pl->nickname_ + "'s LP is now " + std::to_string(lp_[player]) + ".");
     } else if (msg_ == MSG_ATTACK) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto attacker = read_u32();
@@ -4699,7 +5218,7 @@ private:
       }
     } else if (msg_ == MSG_BATTLE) {
       if (!verbose_) {
-        dp_ = dl_;
+        skip_msg();
         return;
       }
       auto attacker = read_u32();
@@ -4769,7 +5288,7 @@ private:
       // Display-only messages that need no answer. They used to fall through
       // to "Unknown message" and abort the process; skip them like the other
       // display-only messages above.
-      dp_ = dl_;
+      skip_msg();
     } else if (msg_ == MSG_RETRY) {
       throw std::runtime_error("Retry");
     } else if (msg_ == MSG_SELECT_BATTLECMD) {
@@ -4849,15 +5368,19 @@ private:
       to_play_ = player;
       callback_ = [this, n_activatables, n_attackables, to_ep, to_m2](int idx) {
         const auto &la = legal_actions_[idx];
-        if (idx < n_activatables) {
+        // The phase is tested first: with version 2 a phase change kept
+        // under the cut sits at an index below the number of cards. Without
+        // the cut a phase change is always behind them, so the order of the
+        // tests makes no difference for version 1.
+        if ((la.phase_ == ActionPhase::End) && to_ep) {
+          YGO_SetResponsei(pduel_, 3);
+        } else if ((la.phase_ == ActionPhase::Main2) && to_m2) {
+          YGO_SetResponsei(pduel_, 2);
+        } else if (idx < n_activatables) {
           YGO_SetResponsei(pduel_, idx << 16);
         } else if (idx < (n_activatables + n_attackables)) {
           idx = idx - n_activatables;
           YGO_SetResponsei(pduel_, (idx << 16) + 1);
-        } else if ((la.phase_ == ActionPhase::End) && to_ep) {
-          YGO_SetResponsei(pduel_, 3);
-        } else if ((la.phase_ == ActionPhase::Main2) && to_m2) {
-          YGO_SetResponsei(pduel_, 2);
         } else {
           throw std::runtime_error("Invalid option");
         }
@@ -4884,18 +5407,20 @@ private:
           card.set_location(loc);
           auto spec = card.get_spec(player);
           select_specs.push_back(spec);
+          note_own_deck_spec(player, card.controler_, card.location_, spec, code);
           auto s = fmt::format("{}: {}({})", i + 1, card.name_, spec);
           pl->notify(s);
         }
       } else {
         for (int i = 0; i < select_size; ++i) {
-          dp_ += 4;
+          CardCode code = read_u32();
           auto controller = read_u8();
           auto loc = read_u8();
           auto seq = read_u8();
           auto pos = read_u8();
           auto spec = ls_to_spec(loc, seq, pos, controller != player);
           select_specs.push_back(spec);
+          note_own_deck_spec(player, controller, loc, spec, code);
         }
       }
 
@@ -4954,7 +5479,8 @@ private:
         for (const auto &card : cards) {
           auto spec = card.get_spec(player);
           specs.push_back(spec);
-          note_confirmed_spec(card.controler_, card.location_, card.sequence_, spec, card.code_);
+          note_confirmed_spec(player, card.controler_, card.location_, card.sequence_, spec, card.code_);
+          note_own_deck_spec(player, card.controler_, card.location_, spec, card.code_);
           int i = specs.size();
           if (card.controler_ != player && card.position_ & POS_FACEDOWN) {
             pl->notify(
@@ -4973,13 +5499,17 @@ private:
           auto pos = read_u8();
           auto spec = ls_to_spec(loc, seq, pos, controller != player);
           specs.push_back(spec);
-          note_confirmed_spec(controller, loc, seq, spec, code);
+          note_confirmed_spec(player, controller, loc, seq, spec, code);
+          note_own_deck_spec(player, controller, loc, spec, code);
         }
       }
 
       if (discard_hand_) {
         discard_hand_ = false;
-        if (current_phase_ == PHASE_END) {
+        // Version 1 discards for the hand size limit at random, without the
+        // model and without a history entry. Version 2 (docs/OBS_V2.md, G1)
+        // takes the normal card selection path below.
+        if (current_phase_ == PHASE_END && !obs_v2(player)) {
           // random discard
           std::vector<int> comb(size);
           std::iota(comb.begin(), comb.end(), 0);
@@ -5048,7 +5578,7 @@ private:
         }
       } else {
         for (int i = 0; i < size; ++i) {
-          dp_ += 4;
+          CardCode code = read_u32();
           auto controller = read_u8();
           auto loc = read_u8();
           auto seq = read_u8();
@@ -5056,6 +5586,7 @@ private:
 
           auto spec = ls_to_spec(loc, seq, 0, controller != player);
           specs.push_back(spec);
+          note_own_deck_spec(player, controller, loc, spec, code);
 
           release_params.push_back(release_param);
         }
@@ -5176,7 +5707,7 @@ private:
         }
       } else {
         for (int i = 0; i < select_size; ++i) {
-          dp_ += 4;
+          CardCode code = read_u32();
           auto controller = read_u8();
           auto loc = read_u8();
           auto seq = read_u8();
@@ -5185,6 +5716,7 @@ private:
           auto spec = ls_to_spec(loc, seq, 0, controller != player);
           select_specs.push_back(spec);
           select_params.push_back(param);
+          note_own_deck_spec(player, controller, loc, spec, code);
         }
       }
 
@@ -5242,6 +5774,7 @@ private:
         uint8_t seq = read_u8();
         uint8_t pos = read_u8();
         specs.push_back(ls_to_spec(loc, seq, pos, c != player));
+        note_own_deck_spec(player, c, loc, specs.back(), code);
         uint32_t desc = read_u32();
         descs.push_back(desc);
       }
@@ -5367,6 +5900,7 @@ private:
       auto pos = read_u8();
       auto desc = read_u32();
       std::string spec = ls_to_spec(loc, seq, pos, ct != player);
+      note_own_deck_spec(player, ct, loc, spec, code);
       auto [code_d, eff_idx] = unpack_desc(code, desc);
       if (desc == 0) {
         code_d = code;

@@ -205,6 +205,10 @@ What the client must send so that ygoinf builds what training saw (the reference
 - Cards in env order: own cards then the opponent's; per player deck, hand, monster zones, spell
   zones, graveyard, banished, extra deck; per location in core sequence order; xyz materials right
   before their monster, with `overlay_sequence`.
+- Exception (added on `obs-v2-impl`, see `docs/notes/obs-v2-impl.md`): the remaining own deck may
+  come in any order. The model can't see the order of the card rows. Send one entry per remaining
+  deck card with its code. A message that names an own-deck card is sent unchanged, with the card's
+  code. With observation version 2 ygoinf finds the row by the code.
 - Own cards: all fields. `attribute`, `race`, `types` from the card database (printed values).
   `level`, `attack`, `defense` current values from the query (level: rank or link rating if
   non-zero; a link monster's defense is its link marker). Materials: printed values, link

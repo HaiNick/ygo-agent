@@ -30,6 +30,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("ckpt")
 ap.add_argument("--num-embeddings", type=int, required=True)
 ap.add_argument("--vectors", default=os.path.expanduser("~/ygo/embeddings/voyage2.pkl"))
+ap.add_argument("--obs-version", type=int, default=1, help="observation version of the env (docs/OBS_V2.md)")
 args = ap.parse_args()
 args.ckpt = os.path.abspath(os.path.join(ORIG_CWD, args.ckpt))
 args.vectors = os.path.abspath(os.path.join(ORIG_CWD, args.vectors))
@@ -41,7 +42,7 @@ vectors = pickle.load(open(args.vectors, "rb"))
 deck = init_ygopro("YGOPro-v1", "english", "../assets/deck/BlueEyes.ydk", "code_list.txt")
 envs = ygoenv.make(task_id="YGOPro-v1", env_type="gymnasium", num_envs=1, num_threads=1, seed=0,
                    deck1=deck, deck2=deck, player=-1, max_options=24, n_history_actions=32,
-                   play_mode="random", async_reset=False)
+                   play_mode="random", async_reset=False, obs_version=args.obs_version)
 obs, _ = envs.reset()
 obs = {k: v for k, v in obs.items() if k != "mask_"}
 obs["mask_"] = None  # as EnvPreprocess(skip_mask=True)
