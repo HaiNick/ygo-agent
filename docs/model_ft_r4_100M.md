@@ -1,6 +1,8 @@
 # Model: `ft_r4_100M_main15017.flax_model`
 
-The current best model. It's the last checkpoint of run `ft_0546_pool52_r4`, copied to
+The best model on observation version 1. Since 2026-11-22 the promoted model is
+`ft_v2_50M_main15017.flax_model` (`docs/model_ft_v2_50M.md`), which started from this one and
+scores 0.649 against it. This model is the last checkpoint of run `ft_0546_pool52_r4`, copied to
 `scripts/checkpoints/` (the folder is git-ignored, so the file itself isn't in the repository).
 
 | Item | Value |
@@ -54,11 +56,11 @@ same start checkpoint.
 # continue training from it
 INIT=scripts/checkpoints/ft_r4_100M_main15017.flax_model TB_OFFSET=104857600 tools/train_finetune.sh RUN_NAME
 
-# compare a new checkpoint against it
+# compare a new checkpoint against it (add OBS_VERSION1=2 for a version 2 checkpoint)
 tools/eval_vs_baseline.sh NEW_CHECKPOINT scripts/checkpoints/ft_r4_100M_main15017.flax_model
 
-# serve it (tools/start_inf_server.sh uses it by default)
-tools/start_inf_server.sh
+# serve it (version 1 is the default for a checkpoint given by hand)
+tools/start_inf_server.sh scripts/checkpoints/ft_r4_100M_main15017.flax_model
 ```
 
 Replace `RUN_NAME` with the new run's folder name and `NEW_CHECKPOINT` with the checkpoint path.
