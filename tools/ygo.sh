@@ -27,7 +27,7 @@
 #
 # start passes these environment variables to tools/train_finetune.sh: INIT
 # (default: MODEL), TB_OFFSET (default: MODEL_STEPS when INIT is not given),
-# OBS_VERSION (default: MODEL_OBS_VERSION when INIT is not given, else 1),
+# OBS_VERSION (default: MODEL_OBS_VERSION when INIT is not given, else 1 with a warning),
 # SAVE_INTERVAL (default 500), XLA_MEM_FRACTION (default 0.65), NUM_ENVS,
 # ACTOR_THREADS, NUM_STEPS, DECK_DIR, SEED, EXTRA.
 #
@@ -91,6 +91,10 @@ start)
   RUN="${1:-ft_$(date +%Y%m%d_%H%M)}"
   if [[ -z "${INIT:-}" ]]; then
     export INIT="$MODEL" TB_OFFSET="${TB_OFFSET:-$MODEL_STEPS}" OBS_VERSION="${OBS_VERSION:-$MODEL_OBS_VERSION}"
+  elif [[ -z "${OBS_VERSION:-}" ]]; then
+    echo "WARNING: INIT is set but OBS_VERSION is not, so this run trains on observation version 1." >&2
+    echo "WARNING: if INIT is a version 2 checkpoint (such as $(basename "$MODEL")), stop it" \
+      "(tools/ygo.sh stop $RUN) and start a new run with OBS_VERSION=2." >&2
   fi
   export SAVE_INTERVAL="${SAVE_INTERVAL:-500}" XLA_MEM_FRACTION="${XLA_MEM_FRACTION:-0.65}"
   "$REPO/tools/train_finetune.sh" "$RUN"
