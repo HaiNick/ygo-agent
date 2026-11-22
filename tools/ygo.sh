@@ -8,24 +8,33 @@
 #   tools/ygo.sh list                  all run folders with their state
 #   tools/ygo.sh record [RUN] DECK [GAMES] [OPPONENT]
 #                                      newest checkpoint of RUN vs OPPONENT (default: the
-#                                      promoted model), recorded as replays; works while
-#                                      training runs
+#                                      promoted model), recorded as replays. Runs on the
+#                                      CPU, so it works next to training (DEVICE=gpu to
+#                                      use the GPU)
 #   tools/ygo.sh eval   [RUN] [full]   newest checkpoint vs the promoted model per deck
-#                                      (quick 4-deck subset unless "full")
+#                                      (quick 4-deck subset unless "full"). On the CPU
+#                                      while a training process runs, else on the GPU
+#                                      (DEVICE=cpu or DEVICE=gpu to choose)
 #   tools/ygo.sh tb                    TensorBoard on http://localhost:6006
 #   tools/ygo.sh tui                   dashboard (tools/ygo_tui.py)
 #
 # RUN defaults to the run used last (~/ygo/runs/.current). DECK is a file name in
 # ~/ygo/decks/mine without .ydk, or a path.
-# start passes these environment variables to tools/train_finetune.sh: INIT
-# (default: the promoted model), TB_OFFSET (default: 104906752 with that model),
-# SAVE_INTERVAL (default 500), XLA_MEM_FRACTION (default 0.65), NUM_ENVS,
-# ACTOR_THREADS, NUM_STEPS, DECK_DIR, SEED, EXTRA, OBS_VERSION.
+# The promoted model (docs/model_ft_v2_50M.md): MODEL (default
+# scripts/checkpoints/ft_v2_50M_main15017.flax_model), MODEL_STEPS (its step count, default
+# 155783168) and MODEL_OBS_VERSION (its observation version, default 2). Set all three
+# together when MODEL points at another checkpoint.
 #
-# Observation version (docs/OBS_V2.md): OBS_VERSION=2 with start trains on version 2 (INIT must
-# be a checkpoint for version 2, see tools/obs_v2_ckpt.py). resume, eval and record read the
-# version of a run from its cmd_args. eval and record play the run's checkpoint on its version
-# against the opponent on MODEL_OBS_VERSION (default 1, the promoted model's version).
+# start passes these environment variables to tools/train_finetune.sh: INIT
+# (default: MODEL), TB_OFFSET (default: MODEL_STEPS when INIT is not given),
+# OBS_VERSION (default: MODEL_OBS_VERSION when INIT is not given, else 1 with a warning),
+# SAVE_INTERVAL (default 500), XLA_MEM_FRACTION (default 0.65), NUM_ENVS,
+# ACTOR_THREADS, NUM_STEPS, DECK_DIR, SEED, EXTRA.
+#
+# Observation version (docs/OBS_V2.md): with INIT given, OBS_VERSION=2 trains on version 2
+# (INIT must be a checkpoint for version 2, see tools/obs_v2_ckpt.py). resume, eval and record
+# read the version of a run from its cmd_args. eval and record play the run's checkpoint on its
+# version against MODEL on MODEL_OBS_VERSION.
 #
 # A stop saves the weights, not the optimizer state: every resume starts with
 # fresh Adam moments.
@@ -33,11 +42,26 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 YGO="${YGO_HOME:-$HOME/ygo}"
 RUNS="$YGO/runs"
-MODEL="${MODEL:-$REPO/scripts/checkpoints/ft_r4_100M_main15017.flax_model}"
-MODEL_STEPS=104906752
+MODEL="${MODEL:-$REPO/scripts/checkpoints/ft_v2_50M_main15017.flax_model}"
+MODEL_STEPS="${MODEL_STEPS:-155783168}"
+MODEL_OBS_VERSION="${MODEL_OBS_VERSION:-2}"
 MDPRO_REPLAY="${MDPRO_REPLAY:-/mnt/d/Games/MDPro4/Replay}"
 
 die() { echo "$*" >&2; exit 1; }
+# Device for record and eval. Training fills the GPU memory (11.6 of 12 GB), so a second
+# GPU process can fail with out of memory. DEVICE=cpu|gpu overrides the default.
+#   device cpu  -> cpu unless DEVICE says otherwise (recordings: one env, fast enough)
+#   device auto -> cpu while a training process runs, else the GPU (evals)
+device() {
+  local d="${DEVICE:-$1}"
+  if [[ "$d" == auto ]]; then pgrep -f "cleanba.py" > /dev/null && d=cpu || d=gpu; fi
+  [[ "$d" == gpu ]] && echo gpu || echo cpu
+}
+# run_on cpu|gpu CMD...: run CMD with JAX on that device; cpu also hides the GPU
+run_on() {
+  local d="$1"; shift
+  if [[ "$d" == cpu ]]; then JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES= "$@"; else JAX_PLATFORMS=cuda "$@"; fi
+}
 current() { [[ -f "$RUNS/.current" ]] && cat "$RUNS/.current" || true; }
 pick_run() {  # pick_run [NAME] -> sets RUN, DIR
   RUN="${1:-$(current)}"
@@ -50,7 +74,6 @@ run_obs_version() {  # run_obs_version DIR -> the --obs_version of the run's cmd
   local v; v="$(grep -a -A1 -x -e '--obs_version' "$1/cmd_args" 2>/dev/null | tail -1 || true)"
   [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 1
 }
-MODEL_OBS_VERSION="${MODEL_OBS_VERSION:-1}"
 state() {  # state DIR -> running | stopping | stopped | crashed | new
   local d="$1" r; r="$(basename "$d")"
   if tmux has-session -t "=$r" 2>/dev/null; then
@@ -66,7 +89,13 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
 start)
   RUN="${1:-ft_$(date +%Y%m%d_%H%M)}"
-  if [[ -z "${INIT:-}" ]]; then export INIT="$MODEL"; export TB_OFFSET="${TB_OFFSET:-$MODEL_STEPS}"; fi
+  if [[ -z "${INIT:-}" ]]; then
+    export INIT="$MODEL" TB_OFFSET="${TB_OFFSET:-$MODEL_STEPS}" OBS_VERSION="${OBS_VERSION:-$MODEL_OBS_VERSION}"
+  elif [[ -z "${OBS_VERSION:-}" ]]; then
+    echo "WARNING: INIT is set but OBS_VERSION is not, so this run trains on observation version 1." >&2
+    echo "WARNING: if INIT is a version 2 checkpoint (such as $(basename "$MODEL")), stop it" \
+      "(tools/ygo.sh stop $RUN) and start a new run with OBS_VERSION=2." >&2
+  fi
   export SAVE_INTERVAL="${SAVE_INTERVAL:-500}" XLA_MEM_FRACTION="${XLA_MEM_FRACTION:-0.65}"
   "$REPO/tools/train_finetune.sh" "$RUN"
   echo "$RUN" > "$RUNS/.current"
@@ -134,7 +163,8 @@ record)
   echo "recording $games games: $(basename "$ck") vs $(basename "$opp"), deck $(basename "$deck" .ydk)"
   obs=(); v="$(run_obs_version "$DIR")"
   [[ "$v" != 1 || "$MODEL_OBS_VERSION" != 1 ]] && obs=(--obs_version1 "$v" --obs_version2 "$MODEL_OBS_VERSION")
-  XLA_PYTHON_CLIENT_PREALLOCATE=false python "$REPO/scripts/battle.py" --deck "$deck" --checkpoint1 "$ck" \
+  dev="$(device cpu)"; echo "device: $dev"
+  XLA_PYTHON_CLIENT_PREALLOCATE=false run_on "$dev" python "$REPO/scripts/battle.py" --deck "$deck" --checkpoint1 "$ck" \
     --checkpoint2 "$opp" --num_embeddings 15017 --num_episodes "$games" --record "${obs[@]}" > match.log 2>&1 \
     || { tail -5 match.log; die "recording failed, see $out/match.log"; }
   grep -a "win_rate=" match.log | tail -1
@@ -150,8 +180,9 @@ eval)
   if [[ -n "${1:-}" && -d "$RUNS/$1" ]]; then pick_run "$1"; shift; else pick_run ""; fi
   ck="$(newest_ckpt "$DIR")"; [[ -n "$ck" ]] || die "$RUN has no checkpoint yet"
   [[ "${1:-}" == full ]] && q=0 || q=1
+  dev="$(device auto)"; echo "device: $dev"
   QUICK=$q XLA_PYTHON_CLIENT_PREALLOCATE=false OBS_VERSION1="$(run_obs_version "$DIR")" \
-    OBS_VERSION2="$MODEL_OBS_VERSION" "$REPO/tools/eval_vs_baseline.sh" "$ck" "$MODEL"
+    OBS_VERSION2="$MODEL_OBS_VERSION" run_on "$dev" "$REPO/tools/eval_vs_baseline.sh" "$ck" "$MODEL"
   ;;
 tb)
   tmux has-session -t "=ygo_tb" 2>/dev/null && die "TensorBoard already runs: http://localhost:6006 (stop: tmux kill-session -t ygo_tb)"
@@ -164,6 +195,7 @@ tui)
   exec python "$REPO/tools/ygo_tui.py" "$@"
   ;;
 *)
-  sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # print the header comment (everything up to the first non-comment line)
+  awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
   ;;
 esac

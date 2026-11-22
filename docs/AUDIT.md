@@ -55,9 +55,11 @@ All runs used the worktree, separate processes, and `XLA_PYTHON_CLIENT_PREALLOCA
 
 - **Env-only benchmark**: random legal actions, self-play, train pool (52 decks), `max_options=24`.
 - **Instrumented build**: a copy of the env with counters and timers behind `#ifdef YGO_AUDIT`,
-  built outside the repository (`~/ygo/audit_instr/`, patch in `audit_instrumentation.patch`). It
-  compares the env's LP, turn, and phase with the core's own values at every decision, counts
-  truncated decisions, buffer high-water marks, and exposure of hidden zones.
+  built outside the repository. It compares the env's LP, turn, and phase with the core's own
+  values at every decision, counts truncated decisions, buffer high-water marks, and exposure of
+  hidden zones. The build and its data were deleted on 2026-11-22. Only the patch is kept:
+  `~/ygo/audit_instr/audit_instrumentation.patch` (9,788 bytes). It changes only
+  `ygoenv/ygoenv/ygopro/ygopro.h` and applies to that file at `15c7726`.
 - **Model self-play**: `battle.py`, filled 0546 vs itself, 128 parallel games, train pool.
 - **NaN hunt**: 4,000 steps × 128 envs (512,000 decisions), actions sampled from the 0546 policy.
 - **Training data**: TensorBoard scalars of run r4.
