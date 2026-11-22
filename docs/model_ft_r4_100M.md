@@ -12,6 +12,7 @@ scores 0.649 against it. This model is the last checkpoint of run `ft_0546_pool5
 | Size | 74,795,617 bytes, 18.7 million parameters in 128 arrays |
 | Start | `0546_22750M_main15017_filled.flax_model` (upstream 0546 with the table extended to 15,017 cards) |
 | Training | About 104.9 million steps of self-play on the 52-deck pool (`~/ygo/decks/train`), runs r1 to r4, env at `15c7726` |
+| Step count | 104,906,752: r4 started at `TB_OFFSET` 12,386,304 and stopped after 22,588 updates of 4,096 steps (16 envs x 2 actor threads x 128 steps). The last logged step, 104,873,984 at update 22,580, fits. The name's "100M" is 104,906,752 // 2^20; 104,857,600 is 100 x 2^20 and too low by 49,152 |
 | Use | `--num_embeddings 15017` everywhere (the table has 15,018 rows) |
 
 ## Checks (2026-11-14, env at `76cda4a`)
@@ -54,7 +55,7 @@ same start checkpoint.
 
 ```bash
 # continue training from it
-INIT=scripts/checkpoints/ft_r4_100M_main15017.flax_model TB_OFFSET=104857600 tools/train_finetune.sh RUN_NAME
+INIT=scripts/checkpoints/ft_r4_100M_main15017.flax_model TB_OFFSET=104906752 tools/train_finetune.sh RUN_NAME
 
 # compare a new checkpoint against it (add OBS_VERSION1=2 for a version 2 checkpoint)
 tools/eval_vs_baseline.sh NEW_CHECKPOINT scripts/checkpoints/ft_r4_100M_main15017.flax_model
