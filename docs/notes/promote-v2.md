@@ -1,8 +1,8 @@
 # promote-v2: promotion of the first version 2 model
 
 Branch `promote-v2`, based on `new-cards` (`9023f0d`). Session of 2026-11-22. Run
-`ft_obs_v2_r1` was training the whole time, so everything ran on the CPU and `~/ygo/runs` was
-only read. No env build, no change to `ygoenv/`, `ygoinf/` or the training code.
+`ft_obs_v2_r1` was training the whole time, so everything ran on the CPU. `ft_obs_v2_r1` was
+only read; the approved cleanup deleted from the other run folders. No env build, no change to `ygoenv/`, `ygoinf/` or the training code.
 
 ## Summary
 
@@ -14,7 +14,8 @@ only read. No env build, no change to `ygoenv/`, `ygoinf/` or the training code.
   `~/ygo/ygo-agent-cpu`).
 - `KNOWN_ISSUES.md` describes `new-cards` at `9023f0d`.
 - The step count of the r4 model is 104,906,752. `docs/model_ft_r4_100M.md` is fixed.
-- Cleanup: a list with recommendations below. Nothing was deleted.
+- Cleanup: a list with recommendations below. After Nicklas's OK about 6.87 GB were deleted, see
+  "Cleanup done".
 
 ## Task 1: which model
 
@@ -112,7 +113,8 @@ fixed.
 
 ## Task 6: cleanup list
 
-Nothing was deleted. Sizes from `du -sh`. "References" means a grep over the three checkouts,
+The state before the cleanup; what was deleted is in "Cleanup done". Sizes from `du -sh`.
+"References" means a grep over the three checkouts,
 `~/ygo/runs/*/run_info.txt`, `~/ygo/evals/*.md`, `~/.bashrc` and `~/.profile`.
 
 ### Git worktrees and branches
@@ -170,6 +172,53 @@ With the two `--delete` runs about 5.7 GB of 11 GB are freed.
 Also seen, not on the list: `0546_trim13472.flax_model` (66 MB), `audit_clean.so` (4.1 MB),
 `code_list_v01.txt` (empty), `code_list_v01compat.txt`, `code_list_864.txt`,
 `.main_so_sha_before_replay_work`. No references were checked for these.
+
+## Cleanup done (2026-11-22)
+
+Done with Nicklas's OK, after the list above. Sizes from `du -sb` (MB = 10^6 bytes).
+
+| Item | Size |
+|---|---|
+| `runs/ft_0546_pool52` | 74.8 MB |
+| `runs/ft_0546_pool52_r2` | 149.8 MB |
+| r3: `1794127019_6M`, `_8M`, `_10M` (only `1794127019_11M_iter1954` is left) | 224.4 MB |
+| r4: 30 checkpoints by `tools/prune_checkpoints.sh --delete`, 16 kept, including the final `1794137851_100M_iter22588` | 2,243.9 MB |
+| r5: 52 checkpoints by `tools/prune_checkpoints.sh --delete`, 18 kept, including the final `1794698802_232M_iter18908` | 3,889.4 MB |
+| `audit_instr/` except `audit_instrumentation.patch` (`docs/AUDIT.md` points at the patch) | 254.0 MB |
+| `audit_base/` | 5.0 MB |
+| `replay_builds/` and `replay_builds.log` | 16.8 MB |
+| `obs_v2/work/` (`obs_v2/ft_r4_100M_main15017_v2init.flax_model` is kept) | 7.9 MB |
+| `ygopro_ygoenv.v0.1-prebuilt.so.bak`, `constraints.txt.bak` | 3.8 MB |
+| Setup logs from 2026-11-07: `ab_build.log`, `ab_build2.log`, `smoke.log`, `train_be.log`, `train_flaxpin.log`, `replay_battle.log` | 0.5 MB |
+| **Total** | **about 6.87 GB** |
+
+- r4 and r5 were pruned only after a fresh dry run listed the same 30 and 52 files as above. The
+  only run checkpoint a doc names (r4's final) is kept.
+- Deleted on `origin-fork`, each checked to be in `new-cards` first: `audit-fixes`, `core-bump`,
+  `obs-v2-design`, `obs-v2-impl`, `train-r5`, `wsl-build`, `ygoinf-announce`. Left: `main`,
+  `new-cards`, `promote-v2`.
+
+| Disk usage | Before (16:12) | After |
+|---|---|---|
+| `~/ygo` | 26 GB | 19 GB |
+| `~/ygo/runs` | 11 GB | 4.6 GB |
+| Used on the WSL disk | 38 GB | 32 GB |
+
+The drop is a little smaller than the deletions because `ft_obs_v2_r1` kept saving a 75 MB
+checkpoint about every 8 minutes.
+
+### Pending
+
+- After `promote-v2` is merged: remove the worktree `~/ygo/ygo-agent-cpu` and the branch
+  `record-on-cpu` (its uncommitted `tools/ygo.sh` diff is ported in `f4ba63e`), and this worktree
+  `~/ygo/wt-promote`.
+- After `ft_obs_v2_r1` stops: dry run of `tools/prune_checkpoints.sh ~/ygo/runs/ft_obs_v2_r1`,
+  then `--delete` with an OK. Keep `1794766131_148M_iter9711` (the promoted model) and
+  `1794763057_110M_iter2718` (gate 1).
+- Not decided: the `selfplay_logs/` files from 2026-11-07 (about 1 MB) and the untracked files in
+  `~/ygo/ygo-agent` (see the list above).
+- `runs/ft_0546_pool52_r3/init_checkpoint` points at the deleted r2 checkpoint. It's only read
+  when r3 is started fresh, which won't happen.
 
 ## Not tested
 
